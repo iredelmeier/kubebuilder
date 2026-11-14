@@ -1,7 +1,8 @@
-# API Versioning in Kubebuilder
+| Authors       | Creation Date | Status      | Extra |
+|---------------|---------------|-------------|-------|
+| @droot | 01/30/2019| implementable | -     |
 
-Authors: @droot 
-Last Updated on: 01/30/2019
+# API Versioning in Kubebuilder
 
 This document describes high level design and workflow for supporting multiple versions in an API built using Kubebuilder. Multi-version support was added as an alpha feature in kubernetes project in 1.13 release. Here are links to some recommended reading material.
 
@@ -19,7 +20,7 @@ This document describes high level design and workflow for supporting multiple v
 
 ## Hub and Spoke
 
-The basic concept is that all versions of an object share the storage. So say if you have versions v1, v2 and v3 of a Kind Toy, kubernetes will use one of the versions to persist the object in stable storage i.e. Etcd. User can specify the version to be used for storage in the Custom Resource definition for that API. 
+The basic concept is that all versions of an object share the storage. So say if you have versions v1, v2 and v3 of a Kind Toy, kubernetes will use one of the versions to persist the object in stable storage i.e. Etcd. User can specify the version to be used for storage in the Custom Resource definition for that API.
 
 One can think storage version as the hub and other versions as spoke to visualize the relationship between storage and other versions (as shown below in the diagram). The key thing to note is that conversion between storage and other version should be lossless (round trippable). As shown in the diagram below, v3 is the storage/hub version and v1, v2 and v4 are spoke version. The document uses storage version and hub interchangeably.
 
@@ -57,7 +58,7 @@ func (ej *ExternalJob) ConvertTo(dst conversion.Hub) error {
         jobv3 := dst.(*v3.ExternalJob)
         jobv3.ObjectMeta = ej.ObjectMeta
          // conversion implementation
-	   // 
+	   //
         return nil
     default:
         return fmt.Errorf("unsupported type %v", t)
@@ -157,12 +158,12 @@ func (ch *conversionHandler) convertObject(src, dst runtime.Object) error {
 
     err = src.(conversion.Convertible).ConvertTo(hub)
     if err != nil {
-        return fmt.Errorf("%T failed to convert to hub version %T : %v", src, hub, err)
+        return fmt.Errorf("%T failed to convert to hub version %T : %w", src, hub, err)
     }
 
     err = dst.(conversion.Convertible).ConvertFrom(hub)
     if err != nil {
-        return fmt.Errorf("%T failed to convert from hub version %T : %v", dst, hub, err)
+        return fmt.Errorf("%T failed to convert from hub version %T : %w", dst, hub, err)
     }
     return nil
 }
@@ -180,7 +181,7 @@ The tool that generates the CRD manifests lives under controller-tools repo. Cur
 
 ## Storage/Serve annotations:
 
-The resource annotation will be extended to indicate storage/serve attributes as shown below. 
+The resource annotation will be extended to indicate storage/serve attributes as shown below.
 
 ```Go
 // ...

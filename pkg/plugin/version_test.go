@@ -17,13 +17,12 @@ limitations under the License.
 package plugin
 
 import (
-	"sort"
+	"slices"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/stage"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/stage"
 )
 
 var _ = Describe("Version", func() {
@@ -122,6 +121,11 @@ var _ = Describe("Version", func() {
 	Context("Compare", func() {
 		// Test Compare() by sorting a list.
 		var (
+			versions       []Version
+			sortedVersions []Version
+		)
+
+		BeforeEach(func() {
 			versions = []Version{
 				{Number: 2, Stage: stage.Alpha},
 				{Number: 44, Stage: stage.Alpha},
@@ -147,15 +151,14 @@ var _ = Describe("Version", func() {
 				{Number: 44, Stage: stage.Alpha},
 				{Number: 44, Stage: stage.Alpha},
 			}
-		)
+		})
 
 		It("sorts a valid list of versions correctly", func() {
-			sort.Slice(versions, func(i int, j int) bool {
-				return versions[i].Compare(versions[j]) == -1
+			slices.SortStableFunc(versions, func(a, b Version) int {
+				return a.Compare(b)
 			})
 			Expect(versions).To(Equal(sortedVersions))
 		})
-
 	})
 
 	Context("IsStable", func() {
@@ -183,5 +186,4 @@ var _ = Describe("Version", func() {
 			Entry("for version 22 (beta)", Version{Number: 22, Stage: stage.Beta}),
 		)
 	})
-
 })

@@ -3,33 +3,33 @@
 When scaffolding out a new project, Kubebuilder provides us with a few
 basic pieces of boilerplate.
 
-## Build Infrastructure
+## Build infrastructure
 
 First up, basic infrastructure for building your project:
 
-<details> <summary>`go.mod`: A new Go module matching our project, with
+<details><summary><code>go.mod</code>: A new Go module matching our project, with
 basic dependencies</summary>
 
-```go
+```text
 {{#include ./testdata/project/go.mod}}
 ```
 </details>
 
-<details><summary>`Makefile`: Make targets for building and deploying your controller</summary>
+<details><summary><code>Makefile</code>: Make targets for building and deploying your controller</summary>
 
 ```makefile
 {{#include ./testdata/project/Makefile}}
 ```
 </details>
 
-<details><summary>`PROJECT`: Kubebuilder metadata for scaffolding new components</summary>
+<details><summary><code>PROJECT</code>: Kubebuilder metadata for scaffolding new components</summary>
 
 ```yaml
 {{#include ./testdata/project/PROJECT}}
 ```
 </details>
 
-## Launch Configuration
+## Launch configuration
 
 We also get launch configurations under the
 [`config/`](https://github.com/kubernetes-sigs/kubebuilder/tree/master/docs/book/src/cronjob-tutorial/testdata/project/config)
@@ -51,7 +51,7 @@ refactored out into its own base:
 - [`config/rbac`](https://github.com/kubernetes-sigs/kubebuilder/tree/master/docs/book/src/cronjob-tutorial/testdata/project/config/rbac): permissions required to run your
   controllers under their own service account
 
-## The Entrypoint
+## The entrypoint
 
 Last, but certainly not least, Kubebuilder scaffolds out the basic
 entrypoint of our project: `main.go`.  Let's take a look at that next...

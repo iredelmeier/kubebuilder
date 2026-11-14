@@ -19,24 +19,33 @@ package machinery
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
+	log "log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/spf13/afero"
 	"golang.org/x/tools/imports"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 const (
 	createOrUpdate = os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 
-	defaultDirectoryPermission os.FileMode = 0700
-	defaultFilePermission      os.FileMode = 0600
+	// DefaultDirectoryPermission and DefaultFilePermission are used so generated
+	// files work in shared and container workflows. Use them when writing scaffolded
+	// or config files for consistency.
+	DefaultDirectoryPermission os.FileMode = 0o755
+	DefaultFilePermission      os.FileMode = 0o644
 )
 
 var options = imports.Options{
@@ -66,8 +75,8 @@ type ScaffoldOption func(*Scaffold)
 func NewScaffold(fs Filesystem, options ...ScaffoldOption) *Scaffold {
 	s := &Scaffold{
 		fs:       fs.FS,
-		dirPerm:  defaultDirectoryPermission,
-		filePerm: defaultFilePermission,
+		dirPerm:  DefaultDirectoryPermission,
+		filePerm: DefaultFilePermission,
 	}
 
 	for _, option := range options {
@@ -102,17 +111,18 @@ func WithConfig(cfg config.Config) ScaffoldOption {
 	}
 }
 
-// WithBoilerplate provides the boilerplate to the Scaffold
+// WithBoilerplate provides the boilerplate to the Scaffold.
+// Any YEAR placeholder in the boilerplate is substituted with the current year.
 func WithBoilerplate(boilerplate string) ScaffoldOption {
 	return func(s *Scaffold) {
-		s.injector.boilerplate = boilerplate
+		s.injector.boilerplate = SubstituteYear(boilerplate)
 	}
 }
 
 // WithResource provides the resource to the Scaffold
-func WithResource(resource *resource.Resource) ScaffoldOption {
+func WithResource(res *resource.Resource) ScaffoldOption {
 	return func(s *Scaffold) {
-		s.injector.resource = resource
+		s.injector.resource = res
 	}
 }
 
@@ -196,6 +206,10 @@ func (Scaffold) buildFileModel(t Template, models map[string]*File) error {
 func doTemplate(t Template) ([]byte, error) {
 	// Create a new template.Template using the type of the Template as the name
 	temp := template.New(fmt.Sprintf("%T", t))
+	leftDelim, rightDelim := t.GetDelim()
+	if leftDelim != "" && rightDelim != "" {
+		temp.Delims(leftDelim, rightDelim)
+	}
 
 	// Set the function map to be used
 	fm := DefaultFuncMap()
@@ -206,22 +220,22 @@ func doTemplate(t Template) ([]byte, error) {
 
 	// Set the template body
 	if _, err := temp.Parse(t.GetBody()); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to parse template: %w", err)
 	}
 
 	// Execute the template
 	out := &bytes.Buffer{}
 	if err := temp.Execute(out, t); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to execute template: %w", err)
 	}
 	b := out.Bytes()
 
 	// TODO(adirio): move go-formatting to write step
 	// gofmt the imports
-	if filepath.Ext(t.GetPath()) == ".go" {
+	if filepath.Ext(t.GetPath()) == goFileExt {
 		var err error
 		if b, err = imports.Process(t.GetPath(), b, &options); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed to process template: %w", err)
 		}
 	}
 
@@ -232,7 +246,23 @@ func doTemplate(t Template) ([]byte, error) {
 func (s Scaffold) updateFileModel(i Inserter, models map[string]*File) error {
 	m, err := s.loadPreviousModel(i, models)
 	if err != nil {
-		return err
+		if errors.Is(err, os.ErrNotExist) {
+			if withOptionalBehavior, ok := i.(HasIfNotExistsAction); ok {
+				switch withOptionalBehavior.GetIfNotExistsAction() {
+				case IgnoreFile:
+					log.Warn("skipping missing file", "file", i.GetPath())
+					log.Warn("the code fragments will not be inserted")
+					return nil
+				case ErrorIfNotExist:
+					return err
+				default:
+					return err
+				}
+			}
+			// If inserter doesn't implement HasIfNotExistsAction, return the original error
+			return err
+		}
+		return fmt.Errorf("failed to load previous model for %s: %w", i.GetPath(), err)
 	}
 
 	// Get valid code fragments
@@ -241,7 +271,7 @@ func (s Scaffold) updateFileModel(i Inserter, models map[string]*File) error {
 	// Remove code fragments that already were applied
 	err = filterExistingValues(m.Contents, codeFragments)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to filter existing values: %w", err)
 	}
 
 	// If no code fragment to insert, we are done
@@ -251,7 +281,7 @@ func (s Scaffold) updateFileModel(i Inserter, models map[string]*File) error {
 
 	content, err := insertStrings(m.Contents, codeFragments)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to insert values: %w", err)
 	}
 
 	// TODO(adirio): move go-formatting to write step
@@ -259,7 +289,7 @@ func (s Scaffold) updateFileModel(i Inserter, models map[string]*File) error {
 	if ext := filepath.Ext(i.GetPath()); ext == ".go" {
 		formattedContent, err = imports.Process(i.GetPath(), content, nil)
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to process formatted content: %w", err)
 		}
 	}
 
@@ -273,9 +303,9 @@ func (s Scaffold) updateFileModel(i Inserter, models map[string]*File) error {
 func (s Scaffold) loadPreviousModel(i Inserter, models map[string]*File) (*File, error) {
 	path := i.GetPath()
 
-	// Lets see if we already have a model for this file
+	// Let's see if we already have a model for this file
 	if m, found := models[path]; found {
-		// Check if there is already an scaffolded file
+		// Check if there is already a scaffolded file
 		exists, err := afero.Exists(s.fs, path)
 		if err != nil {
 			return nil, ExistsFileError{err}
@@ -338,13 +368,7 @@ func getValidCodeFragments(i Inserter) CodeFragmentsMap {
 	// Validate the code fragments
 	validMarkers := i.GetMarkers()
 	for marker := range codeFragments {
-		valid := false
-		for _, validMarker := range validMarkers {
-			if marker == validMarker {
-				valid = true
-				break
-			}
-		}
+		valid := slices.Contains(validMarkers, marker)
 		if !valid {
 			delete(codeFragments, marker)
 		}
@@ -353,26 +377,111 @@ func getValidCodeFragments(i Inserter) CodeFragmentsMap {
 	return codeFragments
 }
 
-// filterExistingValues removes the single-line values that already exists
-// TODO: Add support for multi-line duplicate values
+// filterExistingValues removes code fragments that already exist in the content.
 func filterExistingValues(content string, codeFragmentsMap CodeFragmentsMap) error {
-	scanner := bufio.NewScanner(strings.NewReader(content))
-	for scanner.Scan() {
-		line := scanner.Text()
-		for marker, codeFragments := range codeFragmentsMap {
-			for i, codeFragment := range codeFragments {
-				if strings.TrimSpace(line) == strings.TrimSpace(codeFragment) {
-					codeFragmentsMap[marker] = append(codeFragments[:i], codeFragments[i+1:]...)
-				}
+	for marker, codeFragments := range codeFragmentsMap {
+		codeFragmentsOut := codeFragments[:0]
+
+		for _, codeFragment := range codeFragments {
+			exists, err := codeFragmentExists(content, codeFragment)
+			if err != nil {
+				return fmt.Errorf("failed to check if code fragment exists: %w", err)
 			}
-			if len(codeFragmentsMap[marker]) == 0 {
-				delete(codeFragmentsMap, marker)
+			if !exists {
+				codeFragmentsOut = append(codeFragmentsOut, codeFragment)
 			}
 		}
+
+		if len(codeFragmentsOut) == 0 {
+			delete(codeFragmentsMap, marker)
+		} else {
+			codeFragmentsMap[marker] = codeFragmentsOut
+		}
 	}
+
+	return nil
+}
+
+// codeFragmentExists checks if the codeFragment exists in the content.
+func codeFragmentExists(content, codeFragment string) (exists bool, err error) {
+	// Trim space on each line in order to match different levels of indentation.
+	var sb strings.Builder
+	for line := range strings.SplitSeq(codeFragment, "\n") {
+		_, _ = sb.WriteString(strings.TrimSpace(line))
+		_ = sb.WriteByte('\n')
+	}
+
+	codeFragmentTrimmed := strings.TrimSpace(sb.String())
+	scanLines := 1 + strings.Count(codeFragmentTrimmed, "\n")
+	scanFunc := func(contentGroup string) bool {
+		if contentGroup == codeFragmentTrimmed {
+			exists = true
+			return false
+		}
+		return true
+	}
+
+	if scanMultilineErr := scanMultiline(content, scanLines, scanFunc); scanMultilineErr != nil {
+		return false, scanMultilineErr
+	}
+
+	return exists, nil
+}
+
+// scanMultiline scans a string while buffering the specified number of scanLines. It calls scanFunc
+// for every group of lines. The content passed to scanFunc will have trimmed whitespace. It
+// continues scanning the content as long as scanFunc returns true.
+func scanMultiline(content string, scanLines int, scanFunc func(contentGroup string) bool) error {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+
+	// Optimized simple case.
+	if scanLines == 1 {
+		for scanner.Scan() {
+			if !scanFunc(strings.TrimSpace(scanner.Text())) {
+				if err := scanner.Err(); err != nil {
+					return fmt.Errorf("failed to scan content: %w", err)
+				}
+
+				return nil
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("failed to scan content: %w", err)
+		}
+
+		return nil
+	}
+
+	// Complex case.
+	bufferedLines := make([]string, scanLines)
+	bufferedLinesIndex := 0
+	var sb strings.Builder
+
+	for scanner.Scan() {
+		// Trim space on each line in order to match different levels of indentation.
+		bufferedLines[bufferedLinesIndex] = strings.TrimSpace(scanner.Text())
+		bufferedLinesIndex = (bufferedLinesIndex + 1) % scanLines
+
+		sb.Reset()
+		for i := range scanLines {
+			_, _ = sb.WriteString(bufferedLines[(bufferedLinesIndex+i)%scanLines])
+			_ = sb.WriteByte('\n')
+		}
+
+		if !scanFunc(strings.TrimSpace(sb.String())) {
+			if err := scanner.Err(); err != nil {
+				return fmt.Errorf("failed to scan content: %w", err)
+			}
+
+			return nil
+		}
+	}
+
 	if err := scanner.Err(); err != nil {
-		return err
+		return fmt.Errorf("failed to scan content: %w", err)
 	}
+
 	return nil
 }
 
@@ -394,7 +503,7 @@ func insertStrings(content string, codeFragmentsMap CodeFragmentsMap) ([]byte, e
 		_, _ = out.WriteString(line + "\n") // bytes.Buffer.WriteString always returns nil errors
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to scan content: %w", err)
 	}
 
 	return out.Bytes(), nil
@@ -420,7 +529,7 @@ func (s Scaffold) writeFile(f *File) (err error) {
 	}
 
 	// Create the directory if needed
-	if err := s.fs.MkdirAll(filepath.Dir(f.Path), s.dirPerm); err != nil {
+	if err = s.fs.MkdirAll(filepath.Dir(f.Path), s.dirPerm); err != nil {
 		return CreateDirectoryError{err}
 	}
 
@@ -431,13 +540,23 @@ func (s Scaffold) writeFile(f *File) (err error) {
 	}
 	defer func() {
 		if closeErr := writer.Close(); err == nil && closeErr != nil {
-			err = CloseFileError{err}
+			err = CloseFileError{closeErr}
 		}
 	}()
 
-	if _, err := writer.Write([]byte(f.Contents)); err != nil {
-		return WriteFileError{err}
+	if _, writeErr := writer.Write([]byte(f.Contents)); writeErr != nil {
+		return WriteFileError{writeErr}
 	}
 
 	return nil
+}
+
+var yearPlaceholder = regexp.MustCompile(`\bYEAR\b`)
+
+var nowFunc = time.Now
+
+// SubstituteYear replaces standalone "YEAR" placeholders in the boilerplate string
+// with the current local year.
+func SubstituteYear(boilerplate string) string {
+	return yearPlaceholder.ReplaceAllString(boilerplate, strconv.Itoa(nowFunc().Year()))
 }

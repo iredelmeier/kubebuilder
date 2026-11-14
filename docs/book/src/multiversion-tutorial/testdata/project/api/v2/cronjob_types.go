@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes authors.
+Copyright 2026 The Kubernetes authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,14 +20,16 @@ Since we're in a v2 package, controller-gen will assume this is for the v2
 version automatically.  We could override that with the [`+versionName`
 marker](/reference/markers/crd.md).
 */
+
 package v2
 
 /*
  */
 import (
-	batchv1beta1 "k8s.io/api/batch/v1beta1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 // EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
@@ -40,51 +42,51 @@ We'll leave our spec largely unchanged, except to change the schedule field to a
 */
 // CronJobSpec defines the desired state of CronJob
 type CronJobSpec struct {
-	// The schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.
+	// schedule in Cron format, see https://en.wikipedia.org/wiki/Cron.
+	// +required
 	Schedule CronSchedule `json:"schedule"`
 
 	/*
 	 */
 
-	// +kubebuilder:validation:Minimum=0
-
-	// Optional deadline in seconds for starting the job if it misses scheduled
+	// startingDeadlineSeconds defines in seconds for starting the job if it misses scheduled
 	// time for any reason.  Missed jobs executions will be counted as failed ones.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	StartingDeadlineSeconds *int64 `json:"startingDeadlineSeconds,omitempty"`
 
-	// Specifies how to treat concurrent executions of a Job.
+	// concurrencyPolicy defines how to treat concurrent executions of a Job.
 	// Valid values are:
 	// - "Allow" (default): allows CronJobs to run concurrently;
 	// - "Forbid": forbids concurrent runs, skipping next run if previous run hasn't finished yet;
 	// - "Replace": cancels currently running job and replaces it with a new one
 	// +optional
+	// +kubebuilder:default:=Allow
 	ConcurrencyPolicy ConcurrencyPolicy `json:"concurrencyPolicy,omitempty"`
 
-	// This flag tells the controller to suspend subsequent executions, it does
+	// suspend tells the controller to suspend subsequent executions, it does
 	// not apply to already started executions.  Defaults to false.
 	// +optional
 	Suspend *bool `json:"suspend,omitempty"`
 
-	// Specifies the job that will be created when executing a CronJob.
-	JobTemplate batchv1beta1.JobTemplateSpec `json:"jobTemplate"`
+	// jobTemplate defines the job that will be created when executing a CronJob.
+	// +required
+	JobTemplate batchv1.JobTemplateSpec `json:"jobTemplate"`
 
-	// +kubebuilder:validation:Minimum=0
-
-	// The number of successful finished jobs to retain.
+	// successfulJobsHistoryLimit defines the number of successful finished jobs to retain.
 	// This is a pointer to distinguish between explicit zero and not specified.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	SuccessfulJobsHistoryLimit *int32 `json:"successfulJobsHistoryLimit,omitempty"`
 
-	// +kubebuilder:validation:Minimum=0
-
-	// The number of failed finished jobs to retain.
+	// failedJobsHistoryLimit defines the number of failed finished jobs to retain.
 	// This is a pointer to distinguish between explicit zero and not specified.
 	// +optional
+	// +kubebuilder:validation:Minimum=0
 	FailedJobsHistoryLimit *int32 `json:"failedJobsHistoryLimit,omitempty"`
-
-	//+kubebuilder:docs-gen:collapse=The rest of Spec
 }
+
+// +kubebuilder:docs-gen:collapse=CronJobSpec Full Code
 
 /*
 Next, we'll need to define a type to hold our schedule.
@@ -94,19 +96,19 @@ each corresponding Cron "field".
 
 // describes a Cron schedule.
 type CronSchedule struct {
-	// specifies the minute during which the job executes.
+	// minute specifies the minutes during which the job executes.
 	// +optional
 	Minute *CronField `json:"minute,omitempty"`
-	// specifies the hour during which the job executes.
+	// hour specifies the hour during which the job executes.
 	// +optional
 	Hour *CronField `json:"hour,omitempty"`
-	// specifies the day of the month during which the job executes.
+	// dayOfMonth specifies the day of the month during which the job executes.
 	// +optional
 	DayOfMonth *CronField `json:"dayOfMonth,omitempty"`
-	// specifies the month during which the job executes.
+	// month specifies the month during which the job executes.
 	// +optional
 	Month *CronField `json:"month,omitempty"`
-	// specifies the day of the week during which the job executes.
+	// dayOfWeek specifies the day of the week during which the job executes.
 	// +optional
 	DayOfWeek *CronField `json:"dayOfWeek,omitempty"`
 }
@@ -143,43 +145,73 @@ const (
 	ReplaceConcurrent ConcurrencyPolicy = "Replace"
 )
 
-// CronJobStatus defines the observed state of CronJob
+// CronJobStatus defines the observed state of CronJob.
 type CronJobStatus struct {
 	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
 	// Important: Run "make" to regenerate code after modifying this file
-
-	// A list of pointers to currently running jobs.
+	// active defines a list of pointers to currently running jobs.
 	// +optional
+	// +listType=atomic
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=10
 	Active []corev1.ObjectReference `json:"active,omitempty"`
 
-	// Information when was the last time the job was successfully scheduled.
+	// lastScheduleTime defines the information when was the last time the job was successfully scheduled.
 	// +optional
 	LastScheduleTime *metav1.Time `json:"lastScheduleTime,omitempty"`
+
+	// For Kubernetes API conventions, see:
+	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+
+	// conditions represent the current state of the CronJob resource.
+	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
+	//
+	// Standard condition types include:
+	// - "Available": the resource is fully functional
+	// - "Progressing": the resource is being created or updated
+	// - "Degraded": the resource failed to reach or maintain its desired state
+	//
+	// The status of each condition is one of True, False, or Unknown.
+	// +listType=map
+	// +listMapKey=type
+	// +optional
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-//+kubebuilder:object:root=true
-//+kubebuilder:subresource:status
-
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+// +versionName=v2
 // CronJob is the Schema for the cronjobs API
 type CronJob struct {
-	metav1.TypeMeta   `json:",inline"`
-	metav1.ObjectMeta `json:"metadata,omitempty"`
+	metav1.TypeMeta `json:",inline"`
 
-	Spec   CronJobSpec   `json:"spec,omitempty"`
-	Status CronJobStatus `json:"status,omitempty"`
+	// metadata is a standard object metadata
+	// +optional
+	metav1.ObjectMeta `json:"metadata,omitzero"`
+
+	// spec defines the desired state of CronJob
+	// +required
+	Spec CronJobSpec `json:"spec"`
+
+	// status defines the observed state of CronJob
+	// +optional
+	Status CronJobStatus `json:"status,omitzero"`
 }
 
-//+kubebuilder:object:root=true
+// +kubebuilder:object:root=true
 
 // CronJobList contains a list of CronJob
 type CronJobList struct {
 	metav1.TypeMeta `json:",inline"`
-	metav1.ListMeta `json:"metadata,omitempty"`
+	metav1.ListMeta `json:"metadata,omitzero"`
 	Items           []CronJob `json:"items"`
 }
 
 func init() {
-	SchemeBuilder.Register(&CronJob{}, &CronJobList{})
+	SchemeBuilder.Register(func(s *runtime.Scheme) error {
+		s.AddKnownTypes(SchemeGroupVersion, &CronJob{}, &CronJobList{})
+		return nil
+	})
 }
 
 // +kubebuilder:docs-gen:collapse=Other Types

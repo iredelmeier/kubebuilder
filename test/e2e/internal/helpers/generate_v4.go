@@ -1,0 +1,497 @@
+/*
+Copyright 2020 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+   http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package helpers
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2" //nolint:staticcheck
+	. "github.com/onsi/gomega"    //nolint:staticcheck
+
+	pluginutil "sigs.k8s.io/kubebuilder/v4/pkg/plugin/util"
+	"sigs.k8s.io/kubebuilder/v4/test/e2e/utils"
+)
+
+// GenerateV4 implements a go/v4 plugin project defined by a TestContext.
+func GenerateV4(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+	creatingAPI(kbc)
+
+	By("scaffolding mutating and validating webhooks")
+	err := kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--defaulting",
+		"--programmatic-validation",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to scaffolding mutating webhook")
+
+	By("implementing the mutating and validating webhooks")
+	webhookFilePath := filepath.Join(
+		kbc.Dir, "internal/webhook", kbc.Version,
+		fmt.Sprintf("%s_webhook.go", strings.ToLower(kbc.Kind)))
+	err = utils.ImplementWebhooks(webhookFilePath, strings.ToLower(kbc.Kind))
+	Expect(err).NotTo(HaveOccurred(), "Failed to implement webhooks")
+
+	scaffoldConversionWebhook(kbc)
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "prometheus", "kustomization.yaml"),
+		monitorTLSPatch, "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		metricsCertPatch, "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		metricsCertReplaces, "#")).To(Succeed())
+}
+
+// GenerateV4WithoutMetrics implements a go/v4 plugin project defined by a TestContext.
+func GenerateV4WithoutMetrics(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+	creatingAPI(kbc)
+
+	By("scaffolding mutating and validating webhooks")
+	err := kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--defaulting",
+		"--programmatic-validation",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to scaffolding mutating webhook")
+
+	By("implementing the mutating and validating webhooks")
+	webhookFilePath := filepath.Join(
+		kbc.Dir, "internal/webhook", kbc.Version,
+		fmt.Sprintf("%s_webhook.go", strings.ToLower(kbc.Kind)))
+	err = utils.ImplementWebhooks(webhookFilePath, strings.ToLower(kbc.Kind))
+	Expect(err).NotTo(HaveOccurred(), "Failed to implement webhooks")
+
+	scaffoldConversionWebhook(kbc)
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+	// Disable metrics
+	ExpectWithOffset(1, pluginutil.CommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"- metrics_service.yaml", "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.CommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		metricsTarget, "#")).To(Succeed())
+}
+
+// GenerateV4WithoutWebhooks implements a go/v4 plugin with APIs and enable Prometheus and CertManager
+func GenerateV4WithoutWebhooks(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+	creatingAPI(kbc)
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+}
+
+// GenerateV4WithoutConversionWebhook implements a go/v4 plugin project with admission webhooks only.
+// A Helm chart generated from it accepts webhook.enabled=false, which charts with CRD conversion reject.
+func GenerateV4WithoutConversionWebhook(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+	creatingAPI(kbc)
+
+	By("scaffolding mutating and validating webhooks")
+	err := kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--defaulting",
+		"--programmatic-validation",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to scaffold admission webhooks")
+
+	By("implementing the mutating and validating webhooks")
+	webhookFilePath := filepath.Join(
+		kbc.Dir, "internal/webhook", kbc.Version,
+		fmt.Sprintf("%s_webhook.go", strings.ToLower(kbc.Kind)))
+	err = utils.ImplementWebhooks(webhookFilePath, strings.ToLower(kbc.Kind))
+	Expect(err).NotTo(HaveOccurred(), "Failed to implement webhooks")
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+}
+
+// GenerateV4WithCustomWebhookPath tests webhooks with custom paths
+func GenerateV4WithCustomWebhookPath(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+	creatingAPI(kbc)
+
+	By("scaffolding both defaulting and validation webhooks with different custom paths")
+	err := kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--defaulting",
+		"--programmatic-validation",
+		"--defaulting-path=/custom-mutate-path",
+		"--validation-path=/custom-validate-path",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to scaffold webhooks with custom paths")
+
+	By("verifying custom webhook paths in generated webhook file")
+	webhookFilePath := filepath.Join(
+		kbc.Dir, "internal/webhook", kbc.Version,
+		fmt.Sprintf("%s_webhook.go", strings.ToLower(kbc.Kind)))
+
+	// Read the webhook file and check if both custom paths are present
+	content, err := os.ReadFile(webhookFilePath)
+	Expect(err).NotTo(HaveOccurred(), "Failed to read webhook file")
+	Expect(string(content)).To(ContainSubstring("path=/custom-mutate-path"),
+		"Webhook file should contain custom defaulting path")
+	Expect(string(content)).To(ContainSubstring("path=/custom-validate-path"),
+		"Webhook file should contain custom validation path")
+
+	By("implementing the webhooks")
+	err = utils.ImplementWebhooks(webhookFilePath, strings.ToLower(kbc.Kind))
+	Expect(err).NotTo(HaveOccurred(), "Failed to implement webhook")
+
+	scaffoldConversionWebhook(kbc)
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+
+	By("verifying that --defaulting-path requires --defaulting flag")
+	err = kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", "InvalidTest",
+		"--defaulting-path=/invalid-path",
+		"--make=false",
+	)
+	Expect(err).To(HaveOccurred(), "Should fail when --defaulting-path is used without --defaulting")
+	Expect(err.Error()).To(ContainSubstring("--defaulting-path can only be used with --defaulting"))
+
+	By("verifying that --validation-path requires --programmatic-validation flag")
+	err = kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", "InvalidTest",
+		"--validation-path=/invalid-path",
+		"--make=false",
+	)
+	Expect(err).To(HaveOccurred(), "Should fail when --validation-path is used without --programmatic-validation")
+	Expect(err.Error()).To(ContainSubstring("--validation-path can only be used with --programmatic-validation"))
+}
+
+// GenerateV4WithSSA implements a go/v4 plugin project with Server-Side Apply enabled.
+func GenerateV4WithSSA(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+
+	By("creating API with Server-Side Apply (--ssa)")
+	err := kbc.CreateAPI(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--namespaced",
+		"--resource",
+		"--controller",
+		"--ssa",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to create API with SSA")
+
+	By("implementing the API")
+	ExpectWithOffset(1, pluginutil.InsertCode(
+		filepath.Join(kbc.Dir, "api", kbc.Version, fmt.Sprintf("%s_types.go", strings.ToLower(kbc.Kind))),
+		fmt.Sprintf(`type %sSpec struct {
+`, kbc.Kind),
+		`	// +optional
+Count int `+"`"+`json:"count,omitempty"`+"`"+`
+`)).Should(Succeed())
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+}
+
+// GenerateV4WithSSAClusterScoped implements a go/v4 plugin project with cluster-scoped Server-Side Apply enabled.
+func GenerateV4WithSSAClusterScoped(kbc *utils.TestContext) {
+	initingTheProject(kbc)
+
+	By("creating cluster-scoped API with Server-Side Apply (--ssa --namespaced=false)")
+	err := kbc.CreateAPI(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--namespaced=false",
+		"--resource",
+		"--controller",
+		"--ssa",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to create cluster-scoped API with SSA")
+
+	By("implementing the API")
+	ExpectWithOffset(1, pluginutil.InsertCode(
+		filepath.Join(kbc.Dir, "api", kbc.Version, fmt.Sprintf("%s_types.go", strings.ToLower(kbc.Kind))),
+		fmt.Sprintf(`type %sSpec struct {
+	`, kbc.Kind),
+		`	// +optional
+	Count int `+"`"+`json:"count,omitempty"`+"`"+`
+	`)).Should(Succeed())
+
+	By("verifying +genclient:nonNamespaced marker is present")
+	typesFilePath := filepath.Join(kbc.Dir, "api", kbc.Version, fmt.Sprintf("%s_types.go", strings.ToLower(kbc.Kind)))
+	content, err := os.ReadFile(typesFilePath)
+	Expect(err).NotTo(HaveOccurred(), "Failed to read types file")
+	Expect(string(content)).To(ContainSubstring("+genclient:nonNamespaced"),
+		"Types file should contain +genclient:nonNamespaced marker for cluster-scoped SSA")
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+}
+
+func creatingAPI(kbc *utils.TestContext) {
+	By("creating API definition")
+	err := kbc.CreateAPI(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--namespaced",
+		"--resource",
+		"--controller",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to create API")
+
+	By("implementing the API")
+	ExpectWithOffset(1, pluginutil.InsertCode(
+		filepath.Join(kbc.Dir, "api", kbc.Version, fmt.Sprintf("%s_types.go", strings.ToLower(kbc.Kind))),
+		fmt.Sprintf(`type %sSpec struct {
+`, kbc.Kind),
+		`	// +optional
+Count int `+"`"+`json:"count,omitempty"`+"`"+`
+`)).Should(Succeed())
+}
+
+func initingTheProject(kbc *utils.TestContext) {
+	By("initializing a project")
+	err := kbc.Init(
+		"--plugins", "go/v4",
+		"--project-version", "3",
+		"--domain", kbc.Domain,
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to initialize project")
+}
+
+func initingNamespacedProject(kbc *utils.TestContext) {
+	By("initializing a namespace-scoped project")
+	err := kbc.Init(
+		"--plugins", "go/v4",
+		"--project-version", "3",
+		"--domain", kbc.Domain,
+		"--namespaced",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to initialize namespace-scoped project")
+}
+
+const metricsTarget = `- path: manager_metrics_patch.yaml
+  target:
+    kind: Deployment`
+
+// scaffoldConversionWebhook sets up conversion webhooks for testing the ConversionTest API
+func scaffoldConversionWebhook(kbc *utils.TestContext) {
+	By("scaffolding conversion webhooks for testing ConversionTest v1 to v2 conversion")
+
+	// Create API for v1 (hub) with conversion enabled
+	err := kbc.CreateAPI(
+		"--group", kbc.Group,
+		"--version", "v1",
+		"--kind", "ConversionTest",
+		"--controller=true",
+		"--resource=true",
+		"--make=false",
+	)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "failed to create v1 API for conversion testing")
+
+	// Create API for v2 (spoke) without a controller
+	err = kbc.CreateAPI(
+		"--group", kbc.Group,
+		"--version", "v2",
+		"--kind", "ConversionTest",
+		"--controller=false",
+		"--resource=true",
+		"--make=false",
+	)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "failed to create v2 API for conversion testing")
+
+	// Create the conversion webhook for v1
+	By("setting up the conversion webhook for v1")
+	err = kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", "v1",
+		"--kind", "ConversionTest",
+		"--conversion",
+		"--spoke", "v2",
+		"--make=false",
+	)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "failed to create conversion webhook for v1")
+
+	// Insert Size field in v1
+	By("implementing the size spec in v1")
+	ExpectWithOffset(1, pluginutil.InsertCode(
+		filepath.Join(kbc.Dir, "api", "v1", "conversiontest_types.go"),
+		"Foo *string `json:\"foo,omitempty\"`",
+		"\n\tSize int `json:\"size,omitempty\"` // Number of desired instances",
+	)).NotTo(HaveOccurred(), "failed to add size spec to conversiontest_types v1")
+
+	// Insert Replicas field in v2
+	By("implementing the replicas spec in v2")
+	ExpectWithOffset(1, pluginutil.InsertCode(
+		filepath.Join(kbc.Dir, "api", "v2", "conversiontest_types.go"),
+		"Foo *string `json:\"foo,omitempty\"`",
+		"\n\tReplicas int `json:\"replicas,omitempty\"` // Number of replicas",
+	)).NotTo(HaveOccurred(), "failed to add replicas spec to conversiontest_conversion.go v2")
+
+	err = pluginutil.ReplaceInFile(filepath.Join(kbc.Dir, "api/v2/conversiontest_conversion.go"),
+		"// dst.Spec.Size = src.Spec.Replicas",
+		"dst.Spec.Size = src.Spec.Replicas")
+	Expect(err).NotTo(HaveOccurred(), "failed to implement conversion logic from v1 to v2")
+
+	err = pluginutil.ReplaceInFile(filepath.Join(kbc.Dir, "api/v2/conversiontest_conversion.go"),
+		"// dst.Spec.Replicas = src.Spec.Size",
+		"dst.Spec.Replicas = src.Spec.Size")
+	Expect(err).NotTo(HaveOccurred(), "failed to implement conversion logic from v2 to v1")
+}
+
+const monitorTLSPatch = `#patches:
+#  - path: monitor_tls_patch.yaml
+#    target:
+#      kind: ServiceMonitor`
+
+const metricsCertPatch = `#- path: cert_metrics_manager_patch.yaml
+#  target:
+#    kind: Deployment`
+
+const metricsCertReplaces = `# - source: # Uncomment the following block to enable certificates for metrics
+#     kind: Service
+#     version: v1
+#     name: controller-manager-metrics-service
+#     fieldPath: metadata.name
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: metrics-certs
+#       fieldPaths:
+#         - spec.dnsNames.0
+#         - spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 0
+#         create: true
+#     - select: # Uncomment the following to set the Service name for TLS config in Prometheus ServiceMonitor
+#         kind: ServiceMonitor
+#         group: monitoring.coreos.com
+#         version: v1
+#         name: controller-manager-metrics-monitor
+#       fieldPaths:
+#         - spec.endpoints.0.tlsConfig.serverName
+#       options:
+#         delimiter: '.'
+#         index: 0
+#         create: true
+
+# - source:
+#     kind: Service
+#     version: v1
+#     name: controller-manager-metrics-service
+#     fieldPath: metadata.namespace
+#   targets:
+#     - select:
+#         kind: Certificate
+#         group: cert-manager.io
+#         version: v1
+#         name: metrics-certs
+#       fieldPaths:
+#         - spec.dnsNames.0
+#         - spec.dnsNames.1
+#       options:
+#         delimiter: '.'
+#         index: 1
+#         create: true
+#     - select: # Uncomment the following to set the Service namespace for TLS in Prometheus ServiceMonitor
+#         kind: ServiceMonitor
+#         group: monitoring.coreos.com
+#         version: v1
+#         name: controller-manager-metrics-monitor
+#       fieldPaths:
+#         - spec.endpoints.0.tlsConfig.serverName
+#       options:
+#         delimiter: '.'
+#         index: 1
+#         create: true`
+
+// GenerateV4Namespaced implements a go/v4 plugin namespace-scoped project defined by a TestContext.
+func GenerateV4Namespaced(kbc *utils.TestContext) {
+	initingNamespacedProject(kbc)
+	creatingAPI(kbc)
+
+	By("scaffolding mutating and validating webhooks")
+	err := kbc.CreateWebhook(
+		"--group", kbc.Group,
+		"--version", kbc.Version,
+		"--kind", kbc.Kind,
+		"--defaulting",
+		"--programmatic-validation",
+		"--make=false",
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to scaffolding mutating webhook")
+
+	By("implementing the mutating and validating webhooks")
+	webhookFilePath := filepath.Join(
+		kbc.Dir, "internal/webhook", kbc.Version,
+		fmt.Sprintf("%s_webhook.go", strings.ToLower(kbc.Kind)))
+	err = utils.ImplementWebhooks(webhookFilePath, strings.ToLower(kbc.Kind))
+	Expect(err).NotTo(HaveOccurred(), "Failed to implement webhooks")
+
+	scaffoldConversionWebhook(kbc)
+
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		"#- ../prometheus", "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "prometheus", "kustomization.yaml"),
+		monitorTLSPatch, "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		metricsCertPatch, "#")).To(Succeed())
+	ExpectWithOffset(1, pluginutil.UncommentCode(
+		filepath.Join(kbc.Dir, "config", "default", "kustomization.yaml"),
+		metricsCertReplaces, "#")).To(Succeed())
+}

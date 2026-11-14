@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"go/scanner"
 	"go/token"
-	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
@@ -50,7 +49,12 @@ func (Literate) SupportsOutput(_ string) bool { return true }
 
 // Process implements plugin.Plugin
 func (l Literate) Process(input *plugin.Input) error {
-	bookSrcDir := filepath.Join(input.Context.Root, input.Context.Config.Book.Src)
+	srcDir := input.Context.Config.Book.Src
+	if srcDir == "" {
+		srcDir = "src" // mdBook 0.5.0 no longer populates this field
+	}
+	bookSrcDir := filepath.Join(input.Context.Root, srcDir)
+
 	return plugin.EachCommand(&input.Book, "literatego", func(chapter *plugin.BookChapter, relPath string) (string, error) {
 		chapterDir := filepath.Dir(chapter.Path)
 		pathInfo := filePathInfo{
@@ -58,12 +62,12 @@ func (l Literate) Process(input *plugin.Input) error {
 			chapterDir:          chapterDir,
 			bookSrcDir:          bookSrcDir,
 		}
-		path := pathInfo.FullPath()
+		fullPath := pathInfo.FullPath()
 
 		// TODO(directxman12): don't escape root?
-		contents, err := ioutil.ReadFile(path)
+		contents, err := os.ReadFile(fullPath)
 		if err != nil {
-			return "", fmt.Errorf("unable to import %q: %v", path, err)
+			return "", fmt.Errorf("unable to import %q: %v", fullPath, err)
 		}
 
 		return l.extractContents(contents, pathInfo)
@@ -171,7 +175,7 @@ func extractPairs(contents []byte, path string) ([]commentCodePair, error) {
 	file := fileSet.AddFile(path, -1, len(contents))
 	scan := scanner.Scanner{}
 	var errs []error
-	scan.Init(file, []byte(contents), func(pos token.Position, msg string) {
+	scan.Init(file, contents, func(pos token.Position, msg string) {
 		errs = append(errs, fmt.Errorf("error parsing file %s: %s", pos, msg))
 	}, scanner.ScanComments)
 
@@ -243,10 +247,12 @@ func (l Literate) extractContents(contents []byte, pathInfo filePathInfo) (strin
 
 	for _, pair := range pairs {
 		if pair.collapse != "" {
-			// NB(directxman12): we add the hljs class to "cheat" and get the
-			// right background with theming, since hljs doesn't use CSS
-			// variables.
-			out.WriteString("<details class=\"collapse-code\"><summary class=\"hljs\"><pre class=\"hljs\"><span class=\"hljs-comment\">")
+			collapseClass := "collapse-code"
+			// Hide low-value sections entirely (licenses, imports, etc)
+			if strings.EqualFold(pair.collapse, "Apache License") || strings.EqualFold(pair.collapse, "Imports") {
+				collapseClass = "collapse-code collapse-hide"
+			}
+			out.WriteString("<details class=\"" + collapseClass + "\"><summary class=\"hljs\"><pre class=\"hljs\"><span class=\"collapse-summary\">")
 			out.WriteString(pair.collapse)
 			out.WriteString("</span></pre></summary>")
 		}

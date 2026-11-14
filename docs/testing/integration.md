@@ -4,7 +4,7 @@
 
 This article explores steps to write and run integration tests for controllers created using Kubebuilder. Kubebuilder provides a template for writing integration tests. You can simply run all integration (and unit) tests within the project by running: `make test`
 
-For example, there is a controller watching *Parent* objects. The *Parent* objects create *Child* objects. Note that the *Child* objects must have their `.ownerReferences` field setting to the `Parent` objects. You can find the template under `pkg/controllers/parent/parent_controller_test.go`:
+For example, there is a controller watching *Parent* objects. The *Parent* objects create *Child* objects. Note that the *Child* objects must have their `.ownerReferences` field set to the `Parent` objects. You can find the template under `pkg/controllers/parent/parent_controller_test.go`:
 ```
 package parent
 
@@ -75,7 +75,7 @@ func TestReconcile(t *testing.T) {
 }
 ```
 
-`SetupTestReconcile` function above brings up an API server and etcd instance. Note that there is no any node creation for integration testing environment. If you want to test your controller on a real node, you should write end-to-end tests.
+`SetupTestReconcile` function above brings up an API server and etcd instance. Note that there are no nodes created for the integration testing environment. If you want to test your controller on a real node, you should write end-to-end tests.
 
 The manager is started as part of the test itself (`StartTestManager` function).
 

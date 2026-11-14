@@ -15,9 +15,35 @@
 # limitations under the License.
 
 build_kb
-export PATH=$kb_root_dir/bin:$PATH
 fetch_tools
 install_kind
+
+# Ensures a kindest/node image is available for the given k8s version.
+# Tries to pull a pre-built image first; if unavailable, builds it
+# locally using `kind build node-image` (downloads release artifacts,
+# does not compile Kubernetes from source).
+#
+# Usage:
+#   ensure_node_image <k8s version>
+function ensure_node_image {
+  local version=$1
+  local node_image="kindest/node:${version}"
+
+  if docker image inspect "${node_image}" &>/dev/null; then
+    echo "Node image ${node_image} already available locally"
+    return 0
+  fi
+
+  echo "Attempting to pull ${node_image}..."
+  if docker pull "${node_image}" 2>/dev/null; then
+    echo "Successfully pulled ${node_image}"
+    return 0
+  fi
+
+  echo "Pre-built ${node_image} not available, building node image from release artifacts..."
+  kind build node-image --image "${node_image}" "${version}"
+  echo "Successfully built ${node_image}"
+}
 
 # Creates a named kind cluster given a k8s version.
 # The KIND_CLUSTER variable defines the cluster name and
@@ -28,9 +54,22 @@ install_kind
 #   export KIND_CLUSTER=<kind cluster name>
 #   create_cluster <k8s version>
 function create_cluster {
+  echo "Getting kind config..."
+  KIND_VERSION=$1
   : ${KIND_CLUSTER:?"KIND_CLUSTER must be set"}
+  : ${1:?"k8s version must be set as arg 1"}
   if ! kind get clusters | grep -q $KIND_CLUSTER ; then
-    kind create cluster -v 4 --name $KIND_CLUSTER --retain --wait=1m --config $(dirname "$0")/kind-config.yaml --image=kindest/node:$1
+    version_prefix="${KIND_VERSION%.*}"
+    kind_config=$(dirname "$0")/kind-config.yaml
+    if test -f $(dirname "$0")/kind-config-${version_prefix}.yaml; then
+      kind_config=$(dirname "$0")/kind-config-${version_prefix}.yaml
+    fi
+    ensure_node_image $1
+    echo "Creating cluster..."
+    kind create cluster -v 4 --name $KIND_CLUSTER --retain --wait=5m --config ${kind_config} --image=kindest/node:$1
+    
+    echo "Waiting for cluster to be fully ready..."
+    kubectl wait --for=condition=Ready nodes --all --timeout=5m
   fi
 }
 
@@ -50,6 +89,30 @@ function delete_cluster {
 function test_cluster {
   local flags="$@"
 
-  go test $(dirname "$0")/v2 $flags
-  go test $(dirname "$0")/v3 $flags -timeout 20m
+  # Detect the platform architecture for the kind cluster
+  # Kind clusters now run natively on the host architecture (arm64 on Apple Silicon, amd64 on x86)
+  local kind_platform="linux/amd64"
+  if [[ "$OSTYPE" == "darwin"* ]] && [[ "$(uname -m)" == "arm64" ]]; then
+    kind_platform="linux/arm64"
+  elif [[ "$(uname -m)" == "aarch64" ]]; then
+    kind_platform="linux/arm64"
+  fi
+
+  # Pull images for the correct platform
+  docker pull --platform ${kind_platform} memcached:1.6.26-alpine3.19
+  docker pull --platform ${kind_platform} busybox:1.36.1
+  docker pull --platform ${kind_platform} bitnami/kubectl:latest
+
+  # Load images directly with ctr to avoid kind's --all-platforms issue
+  # kind load docker-image uses --all-platforms internally which breaks with multi-platform manifests
+  docker save memcached:1.6.26-alpine3.19 | docker exec -i $KIND_CLUSTER-control-plane ctr --namespace=k8s.io images import /dev/stdin
+  
+  # Busybox has Docker save issues on some platforms, pull directly as fallback
+  if ! docker save busybox:1.36.1 2>/dev/null | docker exec -i $KIND_CLUSTER-control-plane ctr --namespace=k8s.io images import /dev/stdin 2>/dev/null; then
+    docker exec $KIND_CLUSTER-control-plane ctr --namespace=k8s.io images pull --platform ${kind_platform} docker.io/library/busybox:1.36.1 >/dev/null 2>&1
+  fi
+
+  go test $(dirname "$0")/all $flags -timeout 60m
+
+  docker save bitnami/kubectl:latest | docker exec -i $KIND_CLUSTER-control-plane ctr --namespace=k8s.io images import /dev/stdin
 }

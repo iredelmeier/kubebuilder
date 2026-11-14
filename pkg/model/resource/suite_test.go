@@ -19,11 +19,14 @@ package resource
 import (
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-const v1 = "v1"
+const (
+	v1      = "v1"
+	v1beta1 = "v1beta1"
+)
 
 func TestResource(t *testing.T) {
 	RegisterFailHandler(Fail)

@@ -1,0 +1,600 @@
+//go:build integration
+
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kustomize
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/optional/helm/v2alpha/scaffolds/internal/extractor"
+)
+
+var _ = Describe("Parser", func() {
+	var (
+		parser   *Parser
+		tempFile string
+	)
+
+	BeforeEach(func() {
+		// Create a temporary file for testing
+		tempDir := GinkgoT().TempDir()
+		tempFile = filepath.Join(tempDir, "test-manifest.yaml")
+	})
+
+	Context("with valid YAML containing various resources", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: controller-manager
+  namespace: test-system
+spec:
+  replicas: 1
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: controller-manager
+  namespace: test-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups: [""]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: manager-role
+subjects:
+- kind: ServiceAccount
+  name: controller-manager
+  namespace: test-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: controller-manager-metrics-service
+  namespace: test-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    targetPort: 8443
+  selector:
+    control-plane: controller-manager
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should parse all resources correctly", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resources).NotTo(BeNil())
+
+			// Check that resources were parsed
+			Expect(resources.Namespace).NotTo(BeNil())
+			Expect(resources.Deployment).NotTo(BeNil())
+			Expect(resources.ServiceAccount).NotTo(BeNil())
+
+			// Check RBAC resources
+			Expect(resources.ClusterRoles).To(HaveLen(1))
+			Expect(resources.ClusterRoleBindings).To(HaveLen(1))
+
+			// Check Services
+			Expect(resources.Services).To(HaveLen(1))
+		})
+
+		It("should identify correct resource types", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(resources.Namespace.GetKind()).To(Equal("Namespace"))
+			Expect(resources.Deployment.GetKind()).To(Equal("Deployment"))
+			Expect(resources.ServiceAccount.GetKind()).To(Equal("ServiceAccount"))
+		})
+	})
+
+	Context("with webhook configuration", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- name: test.example.com
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: test-system
+      path: "/validate"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: serving-cert
+  namespace: test-system
+spec:
+  dnsNames:
+  - webhook-service.test-system.svc
+  - webhook-service.test-system.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: selfsigned-issuer
+  secretName: webhook-server-cert
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should parse webhook configurations", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(resources.WebhookConfigurations).To(HaveLen(1))
+			Expect(resources.Certificates).To(HaveLen(1))
+
+			webhook := resources.WebhookConfigurations[0]
+			Expect(webhook.GetKind()).To(Equal("ValidatingWebhookConfiguration"))
+
+			cert := resources.Certificates[0]
+			Expect(cert.GetKind()).To(Equal("Certificate"))
+		})
+	})
+
+	Context("with ServiceMonitor", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: controller-manager-metrics-monitor
+  namespace: test-system
+spec:
+  endpoints:
+  - path: /metrics
+    port: https
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should parse ServiceMonitor", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(resources.ServiceMonitors).To(HaveLen(1))
+
+			monitor := resources.ServiceMonitors[0]
+			Expect(monitor.GetKind()).To(Equal("ServiceMonitor"))
+		})
+	})
+
+	Context("with NetworkPolicy", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-metrics-traffic
+  namespace: test-system
+spec:
+  podSelector:
+    matchLabels:
+      control-plane: controller-manager
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+      - namespaceSelector:
+          matchLabels:
+            metrics: enabled
+      ports:
+        - port: 8443
+          protocol: TCP
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should parse NetworkPolicy", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(resources.NetworkPolicies).To(HaveLen(1))
+
+			np := resources.NetworkPolicies[0]
+			Expect(np.GetKind()).To(Equal("NetworkPolicy"))
+			Expect(np.GetName()).To(Equal("allow-metrics-traffic"))
+		})
+	})
+
+	Context("with the manager replicas set in the manifest", func() {
+		DescribeTable("should keep the replicas when extracting the manager config",
+			func(replicas int) {
+				yamlContent := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-controller-manager
+  namespace: test-system
+  labels:
+    control-plane: controller-manager
+spec:
+  replicas: %d
+  template:
+    spec:
+      containers:
+      - name: manager
+        image: controller:latest
+`, replicas)
+				Expect(os.WriteFile(tempFile, []byte(yamlContent), 0o600)).To(Succeed())
+
+				resources, err := NewParser(tempFile).Parse()
+				Expect(err).NotTo(HaveOccurred())
+				Expect(resources.Deployment).NotTo(BeNil())
+
+				deploymentExtractor := extractor.DeploymentExtractor{}
+				config, err := deploymentExtractor.ExtractDeploymentConfig(resources.Deployment)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(config.Manager.Replicas).NotTo(BeNil())
+				Expect(*config.Manager.Replicas).To(Equal(replicas))
+			},
+			Entry("for 3 replicas", 3),
+			Entry("for scale-to-zero", 0),
+		)
+	})
+
+	Context("with empty or invalid YAML", func() {
+		It("should handle empty file gracefully", func() {
+			err := os.WriteFile(tempFile, []byte(""), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resources).NotTo(BeNil())
+		})
+
+		It("should return error for invalid YAML", func() {
+			invalidYAML := `invalid: yaml: content: [unclosed`
+			err := os.WriteFile(tempFile, []byte(invalidYAML), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+			_, err = parser.Parse()
+			Expect(err).To(HaveOccurred())
+		})
+
+		It("should return error for non-existent file", func() {
+			parser = NewParser("/non/existent/file.yaml")
+			_, err := parser.Parse()
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Context("resource organization", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tests.example.com
+spec:
+  group: example.com
+  versions:
+  - name: v1
+    served: true
+    storage: true
+    schema:
+      openAPIV3Schema:
+        type: object
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned-issuer
+  namespace: test-system
+spec:
+  selfSigned: {}
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should organize CRDs and Issuers correctly", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(resources.CustomResourceDefinitions).To(HaveLen(1))
+			Expect(resources.Issuer).NotTo(BeNil())
+
+			crd := resources.CustomResourceDefinitions[0]
+			Expect(crd.GetKind()).To(Equal("CustomResourceDefinition"))
+
+			issuer := resources.Issuer
+			Expect(issuer.GetKind()).To(Equal("Issuer"))
+		})
+	})
+
+	Context("with custom prefix", func() {
+		BeforeEach(func() {
+			yamlContent := `---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ln-controller-manager
+  namespace: long-name-test-system
+spec:
+  replicas: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ln-controller-manager-metrics-service
+  namespace: long-name-test-system
+spec:
+  ports:
+  - name: https
+    port: 8443
+    targetPort: 8443
+  selector:
+    control-plane: ln-controller-manager
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should use the correct prefix", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			// Use the extractor to extract metadata from parsed resources
+			metadataExtractor := &extractor.MetadataExtractor{}
+			resourceSet := &extractor.ResourceSet{
+				Deployment: resources.Deployment,
+				Services:   resources.Services,
+			}
+			metadata := metadataExtractor.ExtractMetadata(resourceSet, "test-project")
+
+			Expect(metadata.DetectedPrefix).To(Equal("ln"))
+		})
+	})
+
+	Context("with multiple namespace-scoped Roles", func() {
+		BeforeEach(func() {
+			// This test validates the parser correctly handles multiple Roles
+			// with explicit namespaces (for cross-namespace permissions, leader election, etc.)
+			yamlContent := `---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-project-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: test-project-controller-manager
+  namespace: test-project-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: test-project-manager-role
+rules:
+- apiGroups: ["example.com"]
+  resources: ["myresources"]
+  verbs: ["get", "list", "watch", "create", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: test-project-manager-role
+  namespace: infrastructure
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "patch", "update", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: test-project-leader-election-role
+  namespace: production
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: test-project-leader-election-role
+  namespace: test-project-system
+rules:
+- apiGroups: ["coordination.k8s.io"]
+  resources: ["leases"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: test-project-manager-rolebinding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: test-project-manager-role
+subjects:
+- kind: ServiceAccount
+  name: test-project-controller-manager
+  namespace: test-project-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-project-manager-rolebinding
+  namespace: infrastructure
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: test-project-manager-role
+subjects:
+- kind: ServiceAccount
+  name: test-project-controller-manager
+  namespace: test-project-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-project-leader-election-rolebinding
+  namespace: production
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: test-project-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: test-project-controller-manager
+  namespace: test-project-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: test-project-leader-election-rolebinding
+  namespace: test-project-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: test-project-leader-election-role
+subjects:
+- kind: ServiceAccount
+  name: test-project-controller-manager
+  namespace: test-project-system
+`
+			err := os.WriteFile(tempFile, []byte(yamlContent), 0o600)
+			Expect(err).NotTo(HaveOccurred())
+
+			parser = NewParser(tempFile)
+		})
+
+		It("should parse all Roles including those with explicit namespaces", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(resources).NotTo(BeNil())
+
+			// Should parse all 3 namespace-scoped Roles
+			Expect(resources.Roles).To(HaveLen(3), "should have 3 namespace-scoped Roles")
+
+			// Should also parse the ClusterRole
+			Expect(resources.ClusterRoles).To(HaveLen(1), "should have 1 ClusterRole")
+
+			// Verify each Role has correct kind
+			for _, role := range resources.Roles {
+				Expect(role.GetKind()).To(Equal("Role"))
+			}
+
+			// Verify namespaces are preserved in the parsed objects
+			namespaces := make(map[string]bool)
+			for _, role := range resources.Roles {
+				ns := role.GetNamespace()
+				Expect(ns).NotTo(BeEmpty(), "Role should have namespace")
+				namespaces[ns] = true
+			}
+
+			// Should have Roles in 3 different namespaces
+			Expect(namespaces).To(HaveLen(3), "should have Roles in 3 different namespaces")
+			Expect(namespaces).To(HaveKey("infrastructure"))
+			Expect(namespaces).To(HaveKey("production"))
+			Expect(namespaces).To(HaveKey("test-project-system"))
+		})
+
+		It("should parse all RoleBindings including those with explicit namespaces", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			// Should parse all 3 namespace-scoped RoleBindings
+			Expect(resources.RoleBindings).To(HaveLen(3), "should have 3 RoleBindings")
+
+			// Should also parse the ClusterRoleBinding
+			Expect(resources.ClusterRoleBindings).To(HaveLen(1), "should have 1 ClusterRoleBinding")
+
+			// Verify namespaces are preserved
+			namespaces := make(map[string]bool)
+			for _, rb := range resources.RoleBindings {
+				ns := rb.GetNamespace()
+				Expect(ns).NotTo(BeEmpty(), "RoleBinding should have namespace")
+				namespaces[ns] = true
+			}
+
+			Expect(namespaces).To(HaveLen(3), "should have RoleBindings in 3 different namespaces")
+		})
+
+		It("should correctly categorize RBAC resources separately from other resources", func() {
+			resources, err := parser.Parse()
+			Expect(err).NotTo(HaveOccurred())
+
+			// RBAC resources should be in their specific fields
+			Expect(resources.ServiceAccount).NotTo(BeNil())
+			Expect(resources.ClusterRoles).To(HaveLen(1))
+			Expect(resources.Roles).To(HaveLen(3))
+			Expect(resources.ClusterRoleBindings).To(HaveLen(1))
+			Expect(resources.RoleBindings).To(HaveLen(3))
+
+			// RBAC resources should NOT be in "Other"
+			Expect(resources.Other).To(BeEmpty(), "RBAC resources should not be in Other category")
+		})
+	})
+})

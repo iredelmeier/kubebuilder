@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,21 +17,25 @@ limitations under the License.
 package config
 
 import (
-	"sort"
+	"slices"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/stage"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/stage"
 )
 
 var _ = Describe("Version", func() {
 	// Parse, String and Validate are tested by MarshalJSON and UnmarshalJSON
 
 	Context("Compare", func() {
-		// Test Compare() by sorting a list.
 		var (
+			versions       []Version
+			sortedVersions []Version
+		)
+
+		BeforeEach(func() {
+			// Test Compare() by sorting a list.
 			versions = []Version{
 				{Number: 2, Stage: stage.Alpha},
 				{Number: 44, Stage: stage.Alpha},
@@ -57,15 +61,14 @@ var _ = Describe("Version", func() {
 				{Number: 44, Stage: stage.Alpha},
 				{Number: 44, Stage: stage.Alpha},
 			}
-		)
+		})
 
 		It("sorts a valid list of versions correctly", func() {
-			sort.Slice(versions, func(i int, j int) bool {
-				return versions[i].Compare(versions[j]) == -1
+			slices.SortStableFunc(versions, func(a, b Version) int {
+				return a.Compare(b)
 			})
 			Expect(versions).To(Equal(sortedVersions))
 		})
-
 	})
 
 	Context("IsStable", func() {

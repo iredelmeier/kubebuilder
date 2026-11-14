@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,65 +17,322 @@ limitations under the License.
 package cli
 
 import (
+	"errors"
 	"fmt"
-	"sort"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
 )
 
-const (
-	pluginKeysHeader      = "Plugin keys"
-	projectVersionsHeader = "Supported project versions"
+var (
+	supportedPlatforms = []string{"darwin", "linux"}
+	// errHelpDisplayed is returned when help is displayed to prevent command execution
+	errHelpDisplayed = errors.New("help displayed")
 )
 
-func (c CLI) newRootCmd() *cobra.Command {
+// isHelpFlagArg reports whether the given command-line argument is a help flag.
+func isHelpFlagArg(arg string) bool {
+	if arg == helpFlagArg || arg == helpShorthandArg {
+		return true
+	}
+
+	value, found := strings.CutPrefix(arg, helpFlagArg+"=")
+	if !found {
+		value, found = strings.CutPrefix(arg, helpShorthandArg+"=")
+	}
+	if !found {
+		return false
+	}
+
+	help, err := strconv.ParseBool(value)
+	return err == nil && help
+}
+
+// isHelpFlag reports whether the given string asks for help. It also accepts the bare word "help", so use
+// it only for values that cannot hold data, such as a plugin key.
+func isHelpFlag(s string) bool {
+	return isHelpFlagArg(s) || s == kubebuilderSubcommandHelp
+}
+
+// isCompletionRequest reports whether the command is the hidden one Cobra runs to complete a command
+// line. Completions are offered with whatever the command tree holds, so they never fail on the
+// project configuration.
+func isCompletionRequest(cmd *cobra.Command) bool {
+	return cmd.Name() == cobra.ShellCompRequestCmd || cmd.Name() == cobra.ShellCompNoDescRequestCmd
+}
+
+// commandGroupAnnotation marks a command that only holds other subcommands.
+const commandGroupAnnotation = "kubebuilder.io/command-group"
+
+// asCommandGroup marks cmd as a command that only holds other subcommands and makes it display its
+// help, which does not use the project configuration.
+func asCommandGroup(cmd *cobra.Command) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[commandGroupAnnotation] = "true"
+	cmd.RunE = runCommandGroup
+
+	return cmd
+}
+
+// isCommandGroup reports whether cmd was marked by asCommandGroup.
+func isCommandGroup(cmd *cobra.Command) bool {
+	_, isGroup := cmd.Annotations[commandGroupAnnotation]
+
+	return isGroup
+}
+
+// runCommandGroup displays the help of a command that only holds other subcommands. Cobra runs no
+// hook for a command that cannot run and displays its help instead, so a malformed command line
+// would be ignored.
+func runCommandGroup(cmd *cobra.Command, _ []string) error {
+	if err := cmd.Help(); err != nil {
+		return fmt.Errorf("failed to display help: %w", err)
+	}
+
+	return nil
+}
+
+// subcommandPath returns the subcommand names leading from the root command to cmd.
+func subcommandPath(cmd *cobra.Command) []string {
+	var path []string
+	for current := cmd; current.HasParent(); current = current.Parent() {
+		path = append(path, current.Name())
+	}
+	slices.Reverse(path)
+
+	return path
+}
+
+// isAliasOfExtraCommandWithConfig reports whether the command line names, by an alias, an extra
+// command that needs the configuration, such as a tool's docs aliased as version.
+func (c *CLI) isAliasOfExtraCommandWithConfig() bool {
+	positional := positionalArgs(c.args)
+	if len(positional) > 1 && positional[0] == kubebuilderSubcommandHelp {
+		positional = positional[1:]
+	}
+	if len(positional) == 0 {
+		return false
+	}
+
+	for _, cmd := range c.extraCommands {
+		if cmd.Name() != positional[0] && cmd.HasAlias(positional[0]) {
+			return !isSubcommandPathWithoutConfig([]string{cmd.Name()})
+		}
+	}
+
+	return false
+}
+
+// getShortKey converts a full plugin key to a short display key
+// Example: "deploy-image.go.kubebuilder.io/v1-alpha" -> "deploy-image/v1-alpha"
+func getShortKey(fullKey string) string {
+	name, version := plugin.SplitKey(fullKey)
+
+	// Extract the short name (part before .kubebuilder.io or other domain)
+	shortName := name
+	if strings.Contains(name, ".kubebuilder.io") {
+		shortName = strings.TrimSuffix(name, ".kubebuilder.io")
+	} else if idx := strings.LastIndex(name, "."); idx > 0 {
+		// For external plugins, try to get a reasonable short name
+		// Keep the part before the last dot if it looks like a domain
+		parts := strings.Split(name, ".")
+		if len(parts) > 2 {
+			shortName = strings.Join(parts[:len(parts)-1], ".")
+		}
+	}
+
+	// Strip common suffixes for cleaner display
+	// e.g., "deploy-image.go" -> "deploy-image", "kustomize.common" -> "kustomize"
+	shortName = strings.TrimSuffix(shortName, ".go")
+	shortName = strings.TrimSuffix(shortName, ".common")
+
+	if version == "" {
+		return shortName
+	}
+	return shortName + "/" + version
+}
+
+// getPluginDescription returns a short description for a plugin key
+// This is a fallback for plugins that don't implement Describable interface
+func getPluginDescription(_ string) string {
+	// Fallback for external plugins that don't provide descriptions
+	return "External or custom plugin"
+}
+
+// newRootCmd creates the root Cobra command for the CLI.
+func (c *CLI) newRootCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     c.commandName,
 		Long:    c.description,
 		Example: c.rootExamples(),
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return cmd.Help()
 		},
+		PersistentPreRunE: c.checkCommandLine,
 	}
 
 	// Global flags for all subcommands.
-	cmd.PersistentFlags().StringSlice(pluginsFlag, nil, "plugin keys to be used for this subcommand execution")
+	cmd.PersistentFlags().StringSlice(pluginsFlag, nil, pluginsFlagDescription)
 
 	// Register --project-version on the root command so that it shows up in help.
-	cmd.Flags().String(projectVersionFlag, c.defaultProjectVersion.String(), "project version")
+	cmd.Flags().String(projectVersionFlag, c.defaultProjectVersion.String(), projectVersionFlagDescription)
 
-	// As the root command will be used to shot the help message under some error conditions,
+	// As the root command will be used to show the help message under some error conditions,
 	// like during plugin resolving, we need to allow unknown flags to prevent parsing errors.
 	cmd.FParseErrWhitelist = cobra.FParseErrWhitelist{UnknownFlags: true}
 
 	return cmd
 }
 
+// checkCommandLine runs before any command. It answers a help request made through the plugins
+// flag, reports a malformed command line, and reports a project configuration that the command
+// about to run cannot use.
+func (c *CLI) checkCommandLine(cmd *cobra.Command, _ []string) error {
+	// Handles command lines like: kubebuilder init --plugins --help
+	if pluginKeys, err := cmd.Flags().GetStringSlice(pluginsFlag); err == nil {
+		for _, key := range pluginKeys {
+			key = strings.TrimSpace(key)
+			if isHelpFlag(key) {
+				cmd.SilenceUsage = true
+				cmd.SilenceErrors = true
+				_ = cmd.Help()
+				return errHelpDisplayed
+			}
+		}
+	}
+
+	if isCompletionRequest(cmd) {
+		return nil
+	}
+	// A malformed command line is reported for normal commands. Completion requests are
+	// intentionally allowed to inspect partial input.
+	if c.flagErr != nil {
+		return c.flagErr
+	}
+
+	// Cobra resolved the command, so decide by the command, not by the alias the user typed.
+	if isSubcommandPathWithoutConfig(subcommandPath(cmd)) || isCommandGroup(cmd) {
+		return nil
+	}
+	if c.configErr != nil {
+		return c.configErr
+	}
+	if c.configSkipped {
+		return c.resolveSkippedConfig()
+	}
+
+	return nil
+}
+
+// checkCommandLineBeforeHooks makes checkCommandLine run before the argument check and the
+// persistent pre-run hook of cmd and of every command below it. Cobra checks the arguments before
+// any hook and runs only the nearest persistent hook, so the root check would otherwise be skipped.
+// Subcommands added after the CLI is built are not wrapped.
+func (c *CLI) checkCommandLineBeforeHooks(cmd *cobra.Command) {
+	for _, subcommand := range cmd.Commands() {
+		c.checkCommandLineBeforeHooks(subcommand)
+	}
+
+	// Cobra runs no hook for a group with nothing to run, so make it a command group to report a
+	// malformed command line.
+	if c.flagErr != nil && !cmd.Runnable() {
+		asCommandGroup(cmd)
+	}
+
+	validateArgs := cmd.Args
+	cmd.Args = func(executed *cobra.Command, args []string) error {
+		if err := c.checkCommandLine(executed, args); err != nil {
+			return err
+		}
+		if validateArgs == nil {
+			return nil
+		}
+
+		return validateArgs(executed, args)
+	}
+
+	switch {
+	case cmd.PersistentPreRunE != nil:
+		ownHook := cmd.PersistentPreRunE
+		cmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+			if err := c.checkCommandLine(cmd, args); err != nil {
+				return err
+			}
+
+			return ownHook(cmd, args)
+		}
+	case cmd.PersistentPreRun != nil:
+		owner := cmd
+		// Cobra prefers PersistentPreRunE. Read the hook when the command runs, so a hook set later
+		// still runs.
+		cmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+			if err := c.checkCommandLine(cmd, args); err != nil {
+				return err
+			}
+			if owner.PersistentPreRun != nil {
+				owner.PersistentPreRun(cmd, args)
+
+				return nil
+			}
+
+			return c.runParentPersistentHook(owner, cmd, args)
+		}
+	}
+}
+
+// runParentPersistentHook runs the nearest persistent pre-run hook of a parent below the root, as
+// cobra does when a tool clears the hook of cmd after the CLI is built. With
+// cobra.EnableTraverseRunHooks, cobra already ran the parent hooks.
+func (c *CLI) runParentPersistentHook(owner, cmd *cobra.Command, args []string) error {
+	if cobra.EnableTraverseRunHooks {
+		return nil
+	}
+
+	for parent := owner.Parent(); parent != nil && parent != c.cmd; parent = parent.Parent() {
+		if parentHook := parent.PersistentPreRunE; parentHook != nil {
+			return parentHook(cmd, args)
+		}
+		if parent.PersistentPreRun != nil {
+			parent.PersistentPreRun(cmd, args)
+
+			return nil
+		}
+	}
+
+	return nil
+}
+
 // rootExamples builds the examples string for the root command before resolving plugins
 func (c CLI) rootExamples() string {
-	str := fmt.Sprintf(`The first step is to initialize your project:
-    %[1]s init [--plugins=<PLUGIN KEYS> [--project-version=<PROJECT VERSION>]]
+	str := fmt.Sprintf(`Get started by initializing a new project:
 
-<PLUGIN KEYS> is a comma-separated list of plugin keys from the following table
-and <PROJECT VERSION> a supported project version for these plugins.
+    %[1]s init --domain example.org
+
+Use optional plugins when you want extra scaffolding during init:
+
+    %[1]s init --domain example.org --plugins <PLUGIN_KEYS>
+
+Available plugins:
 
 %[2]s
 
-For more specific help for the init command of a certain plugins and project version
-configuration please run:
-    %[1]s init --help --plugins=<PLUGIN KEYS> [--project-version=<PROJECT VERSION>]
+To see help for a command with a specific plugin:
+
+    %[1]s <init|edit|create> --help
+    %[1]s init --help --plugins <PLUGIN_KEYS> [--project-version <PROJECT_VERSION>]
 `,
 		c.commandName, c.getPluginTable())
 
 	if len(c.defaultPlugins) != 0 {
 		if defaultPlugins, found := c.defaultPlugins[c.defaultProjectVersion]; found {
-			str += fmt.Sprintf("\nDefault plugin keys: %q\n", strings.Join(defaultPlugins, ","))
+			str += fmt.Sprintf("\nDefault plugin: %q\n", strings.Join(defaultPlugins, ","))
 		}
-	}
-
-	if c.defaultProjectVersion.Validate() == nil {
-		str += fmt.Sprintf("Default project version: %q\n", c.defaultProjectVersion)
 	}
 
 	return str
@@ -83,41 +340,109 @@ configuration please run:
 
 // getPluginTable returns an ASCII table of the available plugins and their supported project versions.
 func (c CLI) getPluginTable() string {
-	var (
-		maxPluginKeyLength      = len(pluginKeysHeader)
-		pluginKeys              = make([]string, 0, len(c.plugins))
-		maxProjectVersionLength = len(projectVersionsHeader)
-		projectVersions         = make(map[string]string, len(c.plugins))
-	)
+	return c.getPluginTableFiltered(nil)
+}
 
-	for pluginKey, plugin := range c.plugins {
-		if len(pluginKey) > maxPluginKeyLength {
-			maxPluginKeyLength = len(pluginKey)
-		}
-		pluginKeys = append(pluginKeys, pluginKey)
-		supportedProjectVersions := plugin.SupportedProjectVersions()
-		supportedProjectVersionStrs := make([]string, 0, len(supportedProjectVersions))
-		for _, version := range supportedProjectVersions {
-			supportedProjectVersionStrs = append(supportedProjectVersionStrs, version.String())
-		}
-		supportedProjectVersionsStr := strings.Join(supportedProjectVersionStrs, ", ")
-		if len(supportedProjectVersionsStr) > maxProjectVersionLength {
-			maxProjectVersionLength = len(supportedProjectVersionsStr)
-		}
-		projectVersions[pluginKey] = supportedProjectVersionsStr
+// getPluginTableFilteredForSubcommand returns a filtered list of plugins for subcommands,
+// excluding the default scaffold bundle and its component plugins.
+func (c CLI) getPluginTableFilteredForSubcommand(filter func(plugin.Plugin) bool) string {
+	return c.getPluginTableFilteredWithOptions(filter, true)
+}
+
+// getPluginTableFiltered returns a formatted list of plugins filtered by a predicate.
+// If filter is nil, all plugins are included.
+// Deprecated plugins are automatically excluded from help output.
+func (c CLI) getPluginTableFiltered(filter func(plugin.Plugin) bool) string {
+	return c.getPluginTableFilteredWithOptions(filter, false)
+}
+
+// getPluginTableFilteredWithOptions returns a formatted list of plugins with filtering options.
+func (c CLI) getPluginTableFilteredWithOptions(filter func(plugin.Plugin) bool, excludeDefaultScaffold bool) string {
+	type pluginInfo struct {
+		shortKey    string
+		fullKey     string
+		description string
+		versions    string
 	}
 
-	lines := make([]string, 0, len(c.plugins)+2)
-	lines = append(lines, fmt.Sprintf(" %[1]*[2]s | %[3]*[4]s",
-		maxPluginKeyLength, pluginKeysHeader, maxProjectVersionLength, projectVersionsHeader))
-	lines = append(lines, strings.Repeat("-", maxPluginKeyLength+2)+"+"+
-		strings.Repeat("-", maxProjectVersionLength+2))
+	plugins := make([]pluginInfo, 0, len(c.plugins))
 
-	sort.Strings(pluginKeys)
-	for _, pluginKey := range pluginKeys {
-		supportedProjectVersions := projectVersions[pluginKey]
-		lines = append(lines, fmt.Sprintf(" %[1]*[2]s | %[3]*[4]s",
-			maxPluginKeyLength, pluginKey, maxProjectVersionLength, supportedProjectVersions))
+	for pluginKey, p := range c.plugins {
+		// Skip deprecated plugins in help output
+		if deprecated, ok := p.(plugin.Deprecated); ok {
+			if deprecated.DeprecationWarning() != "" {
+				continue
+			}
+		}
+
+		// Apply filter if provided
+		if filter != nil && !filter(p) {
+			continue
+		}
+
+		// Skip base.go plugin to avoid duplication with go plugin
+		if strings.Contains(pluginKey, "base.go.kubebuilder.io") {
+			continue
+		}
+
+		// For subcommands, skip default scaffold and its component plugins
+		if excludeDefaultScaffold {
+			if pluginKey == pluginGoKubebuilderV4 ||
+				pluginKey == "kustomize.common.kubebuilder.io/v2" {
+				continue
+			}
+		}
+
+		shortKey := getShortKey(pluginKey)
+
+		// Get description from plugin if it implements Describable, otherwise use fallback
+		var desc string
+		if describable, ok := p.(plugin.Describable); ok {
+			desc = describable.Description()
+		} else {
+			desc = getPluginDescription(pluginKey)
+		}
+
+		// Get supported project versions
+		supportedVersions := p.SupportedProjectVersions()
+		versionStrs := make([]string, 0, len(supportedVersions))
+		for _, ver := range supportedVersions {
+			versionStrs = append(versionStrs, ver.String())
+		}
+		versionsStr := strings.Join(versionStrs, ", ")
+
+		plugins = append(plugins, pluginInfo{
+			shortKey:    shortKey,
+			fullKey:     pluginKey,
+			description: desc,
+			versions:    versionsStr,
+		})
+	}
+
+	if len(plugins) == 0 {
+		return "No plugins available for this subcommand"
+	}
+
+	// Sort by short key for better readability
+	slices.SortFunc(plugins, func(a, b pluginInfo) int {
+		return strings.Compare(a.shortKey, b.shortKey)
+	})
+
+	// Calculate max width for KEY column
+	maxKeyWidth := len("KEY")
+	for _, p := range plugins {
+		if len(p.shortKey) > maxKeyWidth {
+			maxKeyWidth = len(p.shortKey)
+		}
+	}
+
+	// Build aligned column output
+	lines := make([]string, 0, len(plugins)+1)
+	// Header
+	lines = append(lines, fmt.Sprintf("  %-*s  %s", maxKeyWidth, "KEY", "DESCRIPTION"))
+	// Entries
+	for _, p := range plugins {
+		lines = append(lines, fmt.Sprintf("  %-*s  %s", maxKeyWidth, p.shortKey, p.description))
 	}
 
 	return strings.Join(lines, "\n")

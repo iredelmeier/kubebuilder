@@ -1,0 +1,624 @@
+//go:build integration
+
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package internal
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/spf13/afero"
+	sigsyaml "sigs.k8s.io/yaml"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config/store/yaml"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin/util"
+	"sigs.k8s.io/kubebuilder/v4/test/e2e/utils"
+)
+
+// Integration test for `alpha generate`. The command re-scaffolds a project on
+// disk from its PROJECT file, so it needs the kubebuilder binary in PATH (the
+// test-integration target installs it) but no cluster.
+var _ = Describe("alpha generate", func() {
+	var (
+		kbc         *utils.TestContext
+		snapshotDir string
+	)
+
+	BeforeEach(func() {
+		var err error
+		kbc, err = utils.NewTestContext(util.KubebuilderBinName, "GO111MODULE=on")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(kbc.Prepare()).To(Succeed())
+
+		snapshotDir, err = os.MkdirTemp("", "kb-integration-alpha-generate")
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	AfterEach(func() {
+		Expect(os.RemoveAll(snapshotDir)).To(Succeed())
+		By("removing working dir")
+		kbc.Destroy()
+	})
+
+	It("should re-scaffold a project with an unsupported layout in place, preserving its configuration", func() {
+		By("validating the help output")
+		//nolint:gosec
+		output, err := kbc.Run(exec.Command(kbc.BinaryName, "alpha", "generate", "--help"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(output)).To(ContainSubstring("kubebuilder alpha generate [flags]"))
+
+		By("scaffolding a project with one API and a webhook")
+		err = kbc.Init(
+			"--plugins", "go/v4",
+			"--project-version", "3",
+			"--domain", kbc.Domain,
+		)
+		Expect(err).NotTo(HaveOccurred(), "Failed to initialize project")
+		err = kbc.CreateAPI(
+			"--group", kbc.Group,
+			"--version", kbc.Version,
+			"--kind", kbc.Kind,
+			"--controller=true",
+			"--resource=true",
+			"--make=false",
+		)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create API")
+		err = kbc.CreateWebhook(
+			"--group", kbc.Group,
+			"--version", kbc.Version,
+			"--kind", kbc.Kind,
+			"--defaulting",
+			"--programmatic-validation",
+		)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create webhook")
+
+		// The snapshot is taken before the layout is rewritten below, so the
+		// comparison at the end checks against the configuration the project
+		// really had, layout included.
+		By("keeping the PROJECT file aside for the comparison after the run")
+		projectFile := filepath.Join(kbc.Dir, "PROJECT")
+		originalProject, err := os.ReadFile(projectFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(os.WriteFile(filepath.Join(snapshotDir, "PROJECT"), originalProject, 0o644)).To(Succeed())
+
+		// The command exists to bring forward projects that the installed CLI
+		// can no longer scaffold, so the test must exercise reading a layout
+		// it no longer supports.
+		By("marking the project with a layout that is no longer supported")
+		Expect(util.ReplaceInFile(projectFile, "go.kubebuilder.io/v4", "go.kubebuilder.io/v3")).To(Succeed())
+
+		By("running alpha generate in place")
+		Expect(kbc.Regenerate()).To(Succeed())
+
+		// Both PROJECT files are decoded through the config store, so
+		// formatting and key order cannot mask a real change.
+		By("checking the PROJECT configuration was preserved")
+		originalCfg, err := loadProjectConfig(snapshotDir)
+		Expect(err).NotTo(HaveOccurred())
+		regeneratedCfg, err := loadProjectConfig(kbc.Dir)
+		Expect(err).NotTo(HaveOccurred())
+		diffs, err := compareProjectConfigs(originalCfg, regeneratedCfg)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(diffs).To(BeEmpty(), "alpha generate did not preserve the project configuration:\n  %s",
+			strings.Join(diffs, "\n  "))
+
+		By("checking the layout was upgraded")
+		regeneratedProject, err := os.ReadFile(projectFile)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(regeneratedProject)).To(ContainSubstring("go.kubebuilder.io/v4"))
+		Expect(string(regeneratedProject)).NotTo(ContainSubstring("go.kubebuilder.io/v3"))
+
+		// A command that exits 0 without writing the scaffold would otherwise
+		// pass.
+		By("checking the scaffold was written")
+		for _, path := range []string{
+			"Makefile",
+			"Dockerfile",
+			filepath.Join("cmd", "main.go"),
+			filepath.Join("api", kbc.Version),
+			filepath.Join("internal", "controller"),
+			filepath.Join("internal", "webhook", kbc.Version),
+			filepath.Join("config", "webhook"),
+			filepath.Join("config", "default"),
+		} {
+			_, err := os.Stat(filepath.Join(kbc.Dir, path))
+			Expect(err).NotTo(HaveOccurred(), "missing from the regenerated project: %s", path)
+		}
+	})
+
+	It("should record legacy and mixed controllers by name and leave the source PROJECT file unchanged",
+		func() {
+			const sailorKind = "Sailor"
+			kind := strings.ToLower(kbc.Kind)
+			backup := kind + "-backup"
+
+			By("scaffolding one resource with a controller and another with two")
+			Expect(kbc.Init("--plugins", "go/v4", "--domain", kbc.Domain)).To(Succeed())
+			Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", sailorKind,
+				"--resource", "--controller", "--make=false")).To(Succeed())
+			Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+				"--resource", "--controller", "--make=false")).To(Succeed())
+			Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+				"--resource=false", "--controller", "--controller-name", backup, "--make=false")).To(Succeed())
+
+			By("rewriting the PROJECT file in the legacy and the mixed forms")
+			recordLegacyController(kbc.Dir, resource.GVK{
+				Group: kbc.Group, Domain: kbc.Domain, Version: kbc.Version, Kind: sailorKind,
+			}, "sailor")
+			recordLegacyController(kbc.Dir, resource.GVK{
+				Group: kbc.Group, Domain: kbc.Domain, Version: kbc.Version, Kind: kbc.Kind,
+			}, kind)
+			projectPath := filepath.Join(kbc.Dir, yaml.DefaultPath)
+			legacy, err := os.ReadFile(projectPath)
+			Expect(err).NotTo(HaveOccurred())
+
+			By("regenerating the project into another directory")
+			//nolint:gosec
+			output, err := kbc.Run(exec.Command(kbc.BinaryName, "alpha", "generate", "--output-dir", snapshotDir))
+			Expect(err).NotTo(HaveOccurred(), string(output))
+
+			By("checking that every controller was kept and recorded by name")
+			regenerated, err := loadProjectConfig(snapshotDir)
+			Expect(err).NotTo(HaveOccurred())
+			for kindName, names := range map[string][]string{sailorKind: {"sailor"}, kbc.Kind: {kind, backup}} {
+				res, err := regenerated.GetResource(resource.GVK{
+					Group: kbc.Group, Domain: kbc.Domain, Version: kbc.Version, Kind: kindName,
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.Controller).To(BeFalse()) //nolint:staticcheck // checking the migrated field
+				Expect(res.GetControllerNames()).To(ConsistOf(names))
+				for _, name := range names {
+					Expect(filepath.Join(snapshotDir, "internal", "controller",
+						resource.NormalizeFileName(name)+"_controller.go")).To(BeAnExistingFile())
+				}
+			}
+
+			By("checking that the source PROJECT file was left as it was")
+			Expect(os.ReadFile(projectPath)).To(Equal(legacy))
+		})
+
+	// sharedControllerProject scaffolds a kind in two versions that share one controller, then writes
+	// the controller of both versions in the legacy form or by name. It returns the PROJECT path.
+	sharedControllerProject := func(multiGroup, legacy bool) string {
+		GinkgoHelper()
+
+		kind := strings.ToLower(kbc.Kind)
+		Expect(kbc.Init("--plugins", "go/v4", "--domain", kbc.Domain)).To(Succeed())
+		if multiGroup {
+			Expect(kbc.Edit("--multigroup=true")).To(Succeed())
+		}
+		Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+			"--resource", "--controller", "--make=false")).To(Succeed())
+		Expect(kbc.CreateAPI("--group", kbc.Group, "--version", "v2", "--kind", kbc.Kind,
+			"--resource", "--controller=false", "--make=false")).To(Succeed())
+
+		projectPath := filepath.Join(kbc.Dir, yaml.DefaultPath)
+		projectStore := yaml.New(machinery.Filesystem{FS: afero.NewOsFs()})
+		Expect(projectStore.LoadFrom(projectPath)).To(Succeed())
+		v2 := resource.GVK{Group: kbc.Group, Domain: kbc.Domain, Version: "v2", Kind: kbc.Kind}
+		res, err := projectStore.Config().GetResource(v2)
+		Expect(err).NotTo(HaveOccurred())
+		res.Controllers = &resource.Controllers{{Name: kind}}
+		Expect(projectStore.Config().UpdateResource(res)).To(Succeed())
+		Expect(projectStore.SaveTo(projectPath)).To(Succeed())
+
+		if legacy {
+			for _, version := range []string{kbc.Version, "v2"} {
+				recordLegacyController(kbc.Dir, resource.GVK{
+					Group: kbc.Group, Domain: kbc.Domain, Version: version, Kind: kbc.Kind,
+				}, kind)
+			}
+		}
+
+		return projectPath
+	}
+
+	DescribeTable("should scaffold a controller that versions of a kind share once and keep it on each version",
+		func(multiGroup, legacy, inPlace bool) {
+			sharedControllerProject(multiGroup, legacy)
+			outputDir := kbc.Dir
+			if inPlace {
+				Expect(kbc.Regenerate()).To(Succeed())
+			} else {
+				outputDir = snapshotDir
+				//nolint:gosec
+				output, err := kbc.Run(exec.Command(kbc.BinaryName, "alpha", "generate", "--output-dir", outputDir))
+				Expect(err).NotTo(HaveOccurred(), string(output))
+			}
+
+			kind := strings.ToLower(kbc.Kind)
+			controllerDir := filepath.Join(outputDir, "internal", "controller")
+			if multiGroup {
+				controllerDir = filepath.Join(controllerDir, kbc.Group)
+			}
+			Expect(filepath.Join(controllerDir, kind+"_controller.go")).To(BeAnExistingFile())
+			mainFile, err := os.ReadFile(filepath.Join(outputDir, "cmd", "main.go"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Count(string(mainFile), kbc.Kind+"Reconciler{")).To(Equal(1))
+
+			regenerated, err := loadProjectConfig(outputDir)
+			Expect(err).NotTo(HaveOccurred())
+			for _, version := range []string{kbc.Version, "v2"} {
+				res, err := regenerated.GetResource(resource.GVK{
+					Group: kbc.Group, Domain: kbc.Domain, Version: version, Kind: kbc.Kind,
+				})
+				Expect(err).NotTo(HaveOccurred())
+				Expect(res.GetControllerNames()).To(Equal([]string{kind}))
+			}
+		},
+		Entry("in place, in the legacy form", false, true, true),
+		Entry("in place, by name", false, false, true),
+		Entry("into another directory, in the legacy form", false, true, false),
+		Entry("in place in a multigroup project, by name", true, false, true),
+		Entry("into another directory in a multigroup project, in the legacy form", true, true, false),
+	)
+
+	DescribeTable("should refuse controllers of different kinds that collide before changing anything",
+		func(inPlace bool) {
+			kind := strings.ToLower(kbc.Kind)
+			Expect(kbc.Init("--plugins", "go/v4", "--domain", kbc.Domain)).To(Succeed())
+			Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+				"--resource", "--controller", "--make=false")).To(Succeed())
+			Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", "Sailor",
+				"--resource", "--controller=false", "--make=false")).To(Succeed())
+
+			By("naming Sailor's controller like the existing one")
+			projectPath := filepath.Join(kbc.Dir, yaml.DefaultPath)
+			projectStore := yaml.New(machinery.Filesystem{FS: afero.NewOsFs()})
+			Expect(projectStore.LoadFrom(projectPath)).To(Succeed())
+			sailor, err := projectStore.Config().GetResource(resource.GVK{
+				Group: kbc.Group, Domain: kbc.Domain, Version: kbc.Version, Kind: "Sailor",
+			})
+			Expect(err).NotTo(HaveOccurred())
+			sailor.Controllers = &resource.Controllers{{Name: kind}}
+			Expect(projectStore.Config().UpdateResource(sailor)).To(Succeed())
+			Expect(projectStore.SaveTo(projectPath)).To(Succeed())
+			Expect(os.WriteFile(filepath.Join(kbc.Dir, "NOTES.md"), []byte("user notes\n"), 0o600)).To(Succeed())
+			before := snapshotFiles(kbc.Dir)
+
+			args := []string{"alpha", "generate"}
+			outputDir := filepath.Join(snapshotDir, "out")
+			if !inPlace {
+				args = append(args, "--output-dir", outputDir)
+			}
+			//nolint:gosec
+			output, err := kbc.Run(exec.Command(kbc.BinaryName, args...))
+			Expect(err).To(HaveOccurred())
+			Expect(string(output)).To(ContainSubstring("generate the same code"))
+
+			Expect(snapshotFiles(kbc.Dir)).To(Equal(before), "the project must be left as it was")
+			Expect(outputDir).NotTo(BeAnExistingFile())
+		},
+		Entry("in place", true),
+		Entry("into another directory", false),
+	)
+
+	It("should migrate a deprecated Helm v1-alpha project to v2-alpha with an older Go layout", func() {
+		By("preparing a project with legacy Helm metadata")
+		Expect(kbc.Init("--plugins", "go/v4", "--project-version", "3", "--domain", kbc.Domain)).To(Succeed())
+		projectPath := filepath.Join(kbc.Dir, "PROJECT")
+		projectStore := yaml.New(machinery.Filesystem{FS: afero.NewOsFs()})
+		Expect(projectStore.LoadFrom(projectPath)).To(Succeed())
+		Expect(projectStore.Config().SetPluginChain([]string{
+			"go.kubebuilder.io/v3", pluginHelmKubebuilderV1Alpha,
+		})).To(Succeed())
+		Expect(projectStore.Config().EncodePluginConfig(pluginHelmKubebuilderV1Alpha, map[string]any{})).To(Succeed())
+		Expect(projectStore.SaveTo(projectPath)).To(Succeed())
+
+		By("regenerating the project through the CLI")
+		//nolint:gosec
+		output, err := kbc.Run(exec.Command(kbc.BinaryName, "alpha", "generate", "--output-dir", snapshotDir))
+		Expect(err).NotTo(HaveOccurred(), string(output))
+		Expect(string(output)).To(ContainSubstring("migrating deprecated helm/v1-alpha to helm/v2-alpha"))
+
+		By("checking the saved configuration and generated chart")
+		regeneratedConfig, err := loadProjectConfig(snapshotDir)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(regeneratedConfig.GetPluginChain()).To(Equal([]string{
+			pluginGoKubebuilderV4, pluginHelmKubebuilderV2Alpha,
+		}))
+		var helmConfig map[string]any
+		Expect(regeneratedConfig.DecodePluginConfig(pluginHelmKubebuilderV1Alpha, &helmConfig)).To(
+			MatchError(config.PluginKeyNotFoundError{Key: pluginHelmKubebuilderV1Alpha}))
+		Expect(regeneratedConfig.DecodePluginConfig(pluginHelmKubebuilderV2Alpha, &helmConfig)).To(Succeed())
+		Expect(helmConfig).To(HaveKeyWithValue("manifests", "dist/install.yaml"))
+		Expect(helmConfig).To(HaveKeyWithValue(helmOutputKey, "dist"))
+		for _, path := range []string{"Chart.yaml", "values.yaml", "templates/manager/manager.yaml"} {
+			Expect(filepath.Join(snapshotDir, "dist", "chart", path)).To(BeAnExistingFile())
+		}
+		makefile, err := os.ReadFile(filepath.Join(snapshotDir, "Makefile"))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(makefile)).To(ContainSubstring("helm-deploy:"))
+
+		By("checking that the source project still tracks its legacy configuration")
+		Expect(projectStore.LoadFrom(projectPath)).To(Succeed())
+		Expect(projectStore.Config().DecodePluginConfig(pluginHelmKubebuilderV1Alpha, &helmConfig)).To(Succeed())
+	})
+
+	It("should enable cert-manager in an existing Helm v2-alpha workflow when adding a webhook", func() {
+		Expect(kbc.Init("--plugins", "go/v4", "--domain", kbc.Domain)).To(Succeed())
+		Expect(kbc.CreateAPI("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+			"--resource", "--controller", "--make=false")).To(Succeed())
+		Expect(kbc.Edit("--plugins", "helm/v2-alpha")).To(Succeed())
+
+		workflowPath := filepath.Join(kbc.Dir, ".github", "workflows", "test-chart.yml")
+		workflow, err := os.ReadFile(workflowPath)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(workflow)).To(ContainSubstring("#      - name: Install cert-manager via Helm (wait for readiness)"))
+
+		Expect(kbc.CreateWebhook("--group", kbc.Group, "--version", kbc.Version, "--kind", kbc.Kind,
+			"--defaulting", "--programmatic-validation")).To(Succeed())
+		workflow, err = os.ReadFile(workflowPath)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(workflow)).To(ContainSubstring("\n      - name: Install cert-manager via Helm (wait for readiness)"))
+		Expect(string(workflow)).To(ContainSubstring("\n          helm install cert-manager jetstack/cert-manager \\"))
+		Expect(string(workflow)).To(ContainSubstring("\n            --version ${CERT_MANAGER_VERSION} \\"))
+		Expect(string(workflow)).To(ContainSubstring("\n            --wait \\"))
+		Expect(string(workflow)).To(ContainSubstring("\n            --timeout 300s"))
+		Expect(string(workflow)).NotTo(ContainSubstring("# TODO: Uncomment if cert-manager is enabled"))
+		Expect(string(workflow)).NotTo(ContainSubstring("#      - name: Install cert-manager"))
+	})
+
+	// The regression these two specs guard against: the cleanup deletes the
+	// project directory before the Grafana migration copies the config, so an
+	// in-place run used to replace the user's customisation with the
+	// scaffolded default. The direct migrateGrafanaPlugin tests cannot catch
+	// that ordering, only a run through the command can.
+	It("should preserve a customised Grafana config when regenerating in place", func() {
+		configPath := scaffoldProjectWithCustomisedGrafanaConfig(kbc)
+
+		By("running alpha generate in place")
+		Expect(kbc.Regenerate()).To(Succeed())
+
+		assertGrafanaConfigPreserved(kbc, configPath)
+	})
+
+	It("should preserve a customised Grafana config with --input-dir and no --output-dir", func() {
+		configPath := scaffoldProjectWithCustomisedGrafanaConfig(kbc)
+
+		By("running alpha generate with --input-dir only")
+		Expect(kbc.Regenerate("--input-dir", kbc.Dir)).To(Succeed())
+
+		assertGrafanaConfigPreserved(kbc, configPath)
+	})
+})
+
+// grafanaSentinelConfig is a valid custom-metrics config whose metric name can
+// never appear in a freshly scaffolded default: finding it after a run proves
+// the file is the user's customisation, not a rewritten default.
+const grafanaSentinelConfig = `---
+customMetrics:
+  - metric: sentinel_survives_total
+    type: counter
+`
+
+func scaffoldProjectWithCustomisedGrafanaConfig(kbc *utils.TestContext) string {
+	GinkgoHelper()
+
+	By("scaffolding a project with the Grafana plugin")
+	err := kbc.Init(
+		"--plugins", "go/v4",
+		"--project-version", "3",
+		"--domain", kbc.Domain,
+	)
+	Expect(err).NotTo(HaveOccurred(), "Failed to initialize project")
+	Expect(kbc.Edit("--plugins", "grafana.kubebuilder.io/v1-alpha")).To(Succeed())
+
+	By("customising the Grafana custom metrics config")
+	configPath := filepath.Join(kbc.Dir, "grafana", "custom-metrics", "config.yaml")
+	Expect(os.WriteFile(configPath, []byte(grafanaSentinelConfig), 0o644)).To(Succeed())
+
+	return configPath
+}
+
+func assertGrafanaConfigPreserved(kbc *utils.TestContext, configPath string) {
+	GinkgoHelper()
+
+	By("checking the customised Grafana config survived the run")
+	preserved, err := os.ReadFile(configPath)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(string(preserved)).To(Equal(grafanaSentinelConfig))
+
+	// The second Grafana edit rebuilds the dashboard from the restored
+	// config, so the sentinel metric showing up there proves the preserved
+	// content actually flowed through the migration, not just back to disk.
+	By("checking the dashboard was rebuilt from the preserved config")
+	dashboard, err := os.ReadFile(
+		filepath.Join(kbc.Dir, "grafana", "custom-metrics", "custom-metrics-dashboard.json"))
+	Expect(err).NotTo(HaveOccurred())
+	Expect(string(dashboard)).To(ContainSubstring("sentinel_survives_total"))
+}
+
+func loadProjectConfig(dir string) (config.Config, error) {
+	store := yaml.New(machinery.Filesystem{FS: afero.NewOsFs()})
+	if err := store.LoadFrom(filepath.Join(dir, yaml.DefaultPath)); err != nil {
+		return nil, fmt.Errorf("failed to load the PROJECT file under %q: %w", dir, err)
+	}
+
+	return store.Config(), nil
+}
+
+// compareProjectConfigs checks that `alpha generate` rebuilt the project from
+// the same configuration it started with. Resources are compared as a set: the
+// scaffold replays them in the order the config lists them, which need not
+// match how the original project was built.
+func compareProjectConfigs(original, regenerated config.Config) ([]string, error) {
+	var diffs []string
+
+	scalar := func(name, want, got string) {
+		if want != got {
+			diffs = append(diffs, fmt.Sprintf("%s: expected %q, got %q", name, want, got))
+		}
+	}
+
+	scalar("domain", original.GetDomain(), regenerated.GetDomain())
+	scalar("repository", original.GetRepository(), regenerated.GetRepository())
+	scalar("projectName", original.GetProjectName(), regenerated.GetProjectName())
+	scalar("version", original.GetVersion().String(), regenerated.GetVersion().String())
+	scalar("layout", strings.Join(original.GetPluginChain(), ","),
+		strings.Join(regenerated.GetPluginChain(), ","))
+
+	if original.IsMultiGroup() != regenerated.IsMultiGroup() {
+		diffs = append(diffs, fmt.Sprintf("multigroup: expected %t, got %t",
+			original.IsMultiGroup(), regenerated.IsMultiGroup()))
+	}
+
+	originalResources, err := original.GetResources()
+	if err != nil {
+		return nil, fmt.Errorf("read resources from the original PROJECT file: %w", err)
+	}
+
+	regeneratedResources, err := regenerated.GetResources()
+	if err != nil {
+		return nil, fmt.Errorf("read resources from the regenerated PROJECT file: %w", err)
+	}
+
+	return append(diffs, compareResourceSets(originalResources, regeneratedResources)...), nil
+}
+
+func compareResourceSets(original, regenerated []resource.Resource) []string {
+	want := resourceKeys(original)
+	got := resourceKeys(regenerated)
+
+	var diffs []string
+	for key := range want {
+		if _, ok := got[key]; !ok {
+			diffs = append(diffs, "resource missing after regeneration: "+key)
+		}
+	}
+	for key := range got {
+		if _, ok := want[key]; !ok {
+			diffs = append(diffs, "unexpected resource after regeneration: "+key)
+		}
+	}
+	slices.Sort(diffs)
+
+	return diffs
+}
+
+// resourceKeys renders each resource as a single comparable string so resources
+// can be matched regardless of the order they appear in the config.
+func resourceKeys(resources []resource.Resource) map[string]struct{} {
+	keys := make(map[string]struct{}, len(resources))
+	for _, res := range resources {
+		controllers := slices.Sorted(slices.Values(res.GetControllerNames()))
+		key := fmt.Sprintf("%s/%s/%s controllers=%s webhooks=%s",
+			res.Group, res.Version, res.Kind, strings.Join(controllers, ","), enabledWebhooks(res))
+		keys[key] = struct{}{}
+	}
+
+	return keys
+}
+
+func enabledWebhooks(res resource.Resource) string {
+	if res.Webhooks == nil || res.Webhooks.IsEmpty() {
+		return "none"
+	}
+
+	var enabled []string
+	if res.Webhooks.Defaulting {
+		enabled = append(enabled, "defaulting")
+	}
+	if res.Webhooks.Validation {
+		enabled = append(enabled, "validation")
+	}
+	if res.Webhooks.Conversion {
+		enabled = append(enabled, "conversion")
+	}
+	if len(enabled) == 0 {
+		return "none"
+	}
+	slices.Sort(enabled)
+
+	return strings.Join(enabled, "+")
+}
+
+// snapshotFiles returns the content of every file under dir, by path. The bin directory holds
+// downloaded tools, so it is skipped.
+func snapshotFiles(dir string) map[string]string {
+	GinkgoHelper()
+
+	files := map[string]string{}
+	Expect(filepath.WalkDir(dir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if entry.Name() == "bin" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		content, readErr := os.ReadFile(path)
+		Expect(readErr).NotTo(HaveOccurred())
+		files[path] = string(content)
+
+		return nil
+	})).To(Succeed())
+
+	return files
+}
+
+// recordLegacyController rewrites the PROJECT file under dir as an older release wrote it: the
+// controller name of the resource gvk is recorded with `controller: true` instead of by name.
+func recordLegacyController(dir string, gvk resource.GVK, name string) {
+	GinkgoHelper()
+
+	projectPath := filepath.Join(dir, yaml.DefaultPath)
+	content, err := os.ReadFile(projectPath)
+	Expect(err).NotTo(HaveOccurred())
+	var cfg cfgv3.Cfg
+	Expect(cfg.UnmarshalYAML(content)).To(Succeed())
+
+	found := false
+	for i := range cfg.Resources {
+		res := &cfg.Resources[i]
+		if !res.GVK.IsEqualTo(gvk) {
+			continue
+		}
+		found = true
+		Expect(res.Controllers.HasController(name)).To(BeTrue(), "the controller must be recorded by name")
+		kept := resource.Controllers{}
+		for _, controller := range *res.Controllers {
+			if controller.Name != name {
+				kept = append(kept, controller)
+			}
+		}
+		res.Controller = true //nolint:staticcheck // writing the legacy form is the point
+		res.Controllers = nil
+		if len(kept) > 0 {
+			res.Controllers = &kept
+		}
+	}
+	Expect(found).To(BeTrue(), "the PROJECT file must record the resource")
+
+	// Cfg.MarshalYAML migrates the controller back to its name, so the file is written as it is.
+	legacy, err := sigsyaml.Marshal(cfg)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(os.WriteFile(projectPath, legacy, 0o600)).To(Succeed())
+}

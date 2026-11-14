@@ -17,14 +17,30 @@ limitations under the License.
 package cli
 
 import (
+	"fmt"
+
 	"github.com/spf13/cobra"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
 )
 
-func (CLI) newCreateCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:        "create",
+func (c CLI) newCreateCmd() *cobra.Command {
+	return asCommandGroup(&cobra.Command{
+		Use:        createCommand,
 		SuggestFor: []string{"new"},
 		Short:      "Scaffold a Kubernetes API or webhook",
-		Long:       `Scaffold a Kubernetes API or webhook.`,
-	}
+		Long: fmt.Sprintf(`Scaffold a Kubernetes API or webhook.
+
+Use "create api" to add resources and controllers to an initialized project.
+Use "create webhook" to add defaulting, validating, or conversion webhooks.
+
+Available plugins that support 'create' subcommands:
+
+%s
+`, c.getPluginTableFilteredForSubcommand(func(p plugin.Plugin) bool {
+			_, hasCreateAPI := p.(plugin.CreateAPI)
+			_, hasCreateWebhook := p.(plugin.CreateWebhook)
+			return hasCreateAPI || hasCreateWebhook
+		})),
+	})
 }

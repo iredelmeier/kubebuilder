@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package cli //nolint:dupl
+package cli
 
 import (
 	"fmt"
 
 	"github.com/spf13/cobra"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
 )
 
 const apiErrorMsg = "failed to create API"
@@ -30,11 +30,25 @@ func (c CLI) newCreateAPICmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "api",
 		Short: "Scaffold a Kubernetes API",
-		Long: `Scaffold a Kubernetes API.
-`,
+		Long: `Scaffold a Kubernetes API by adding a resource definition and, when requested, a controller.
+
+Run this command from an initialized project.`,
 		RunE: errCmdFunc(
 			fmt.Errorf("api subcommand requires an existing project"),
 		),
+	}
+
+	// Show hint message on how to list flags instead of showing file completion
+	cmd.ValidArgsFunction = func(
+		_ *cobra.Command,
+		args []string,
+		toComplete string,
+	) ([]cobra.Completion, cobra.ShellCompDirective) {
+		completions := []cobra.Completion{}
+		if len(args) == 0 && toComplete == "" {
+			completions = cobra.AppendActiveHelp(completions, "Type '--' and press TAB to list more flags")
+		}
+		return completions, cobra.ShellCompDirectiveNoFileComp
 	}
 
 	// In case no plugin was resolved, instead of failing the construction of the CLI, fail the execution of
@@ -62,6 +76,12 @@ func (c CLI) newCreateAPICmd() *cobra.Command {
 	}
 
 	c.applySubcommandHooks(cmd, subcommands, apiErrorMsg, false)
+
+	// Append plugin table after metadata updates
+	c.appendPluginTable(cmd, func(p plugin.Plugin) bool {
+		_, isValid := p.(plugin.CreateAPI)
+		return isValid
+	}, "Available plugins that support 'create api'")
 
 	return cmd
 }

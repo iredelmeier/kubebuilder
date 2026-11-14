@@ -18,33 +18,31 @@ package cli
 
 import (
 	"fmt"
-	"sort"
-	"strconv"
-	"strings"
+	"slices"
 
 	"github.com/spf13/cobra"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
 )
 
 const initErrorMsg = "failed to initialize project"
 
 func (c CLI) newInitCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "init",
+		Use:   kubebuilderSubcommandInit,
 		Short: "Initialize a new project",
 		Long: `Initialize a new project.
 
 For further help about a specific plugin, set --plugins.
 `,
 		Example: c.getInitHelpExamples(),
-		Run:     func(cmd *cobra.Command, args []string) {},
+		Run:     func(_ *cobra.Command, _ []string) {},
 	}
 
 	// Register --project-version on the dynamically created command
 	// so that it shows up in help and does not cause a parse error.
-	cmd.Flags().String(projectVersionFlag, c.defaultProjectVersion.String(), "project version")
+	cmd.Flags().String(projectVersionFlag, c.defaultProjectVersion.String(), projectVersionFlagDescription)
 
 	// In case no plugin was resolved, instead of failing the construction of the CLI, fail the execution of
 	// this subcommand. This allows the use of subcommands that do not require resolved plugins like help.
@@ -72,23 +70,41 @@ For further help about a specific plugin, set --plugins.
 
 	c.applySubcommandHooks(cmd, subcommands, initErrorMsg, true)
 
+	// Append plugin table after metadata updates
+	c.appendPluginTable(cmd, func(p plugin.Plugin) bool {
+		_, isValid := p.(plugin.Init)
+		return isValid
+	}, "Available plugins that support 'init'")
+
 	return cmd
 }
 
 func (c CLI) getInitHelpExamples() string {
-	var sb strings.Builder
-	for _, version := range c.getAvailableProjectVersions() {
-		rendered := fmt.Sprintf(`  # Help for initializing a project with version %[2]s
-  %[1]s init --project-version=%[2]s -h
+	projectVersionExample := c.defaultProjectVersion.String()
+	if c.defaultProjectVersion.Validate() != nil {
+		versions := c.getAvailableProjectVersions()
+		if len(versions) == 0 {
+			return fmt.Sprintf(`  # Initialize a new project
+  %[1]s init --domain example.org
 
-`,
-			c.commandName, version)
-		sb.WriteString(rendered)
+  # Initialize with optional plugins
+  %[1]s init --domain example.org --plugins <PLUGIN_KEYS>`, c.commandName)
+		}
+		projectVersionExample = versions[len(versions)-1].String()
 	}
-	return strings.TrimSuffix(sb.String(), "\n\n")
+
+	return fmt.Sprintf(`  # Initialize a new project
+  %[1]s init --domain example.org
+
+  # Initialize with optional plugins
+  %[1]s init --domain example.org --plugins <PLUGIN_KEYS>
+
+  # Initialize with a specific project config version
+  %[1]s init --domain example.org --plugins <PLUGIN_KEYS> --project-version %[2]s`,
+		c.commandName, projectVersionExample)
 }
 
-func (c CLI) getAvailableProjectVersions() (projectVersions []string) {
+func (c CLI) getAvailableProjectVersions() (projectVersions []config.Version) {
 	versionSet := make(map[config.Version]struct{})
 	for _, p := range c.plugins {
 		// Only return versions of non-deprecated plugins.
@@ -99,8 +115,10 @@ func (c CLI) getAvailableProjectVersions() (projectVersions []string) {
 		}
 	}
 	for version := range versionSet {
-		projectVersions = append(projectVersions, strconv.Quote(version.String()))
+		projectVersions = append(projectVersions, version)
 	}
-	sort.Strings(projectVersions)
+	slices.SortFunc(projectVersions, func(a, b config.Version) int {
+		return a.Compare(b)
+	})
 	return projectVersions
 }

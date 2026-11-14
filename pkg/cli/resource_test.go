@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,11 +17,11 @@ limitations under the License.
 package cli
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 var _ = Describe("resourceOptions", func() {
@@ -33,6 +33,12 @@ var _ = Describe("resourceOptions", func() {
 	)
 
 	var (
+		fullGVK     resource.GVK
+		noDomainGVK resource.GVK
+		noGroupGVK  resource.GVK
+	)
+
+	BeforeEach(func() {
 		fullGVK = resource.GVK{
 			Group:   group,
 			Domain:  domain,
@@ -49,7 +55,7 @@ var _ = Describe("resourceOptions", func() {
 			Version: version,
 			Kind:    kind,
 		}
-	)
+	})
 
 	Context("validate", func() {
 		DescribeTable("should succeed for valid options",
@@ -69,27 +75,28 @@ var _ = Describe("resourceOptions", func() {
 
 	Context("newResource", func() {
 		DescribeTable("should succeed if the Resource is valid",
-			func(options resourceOptions) {
+			func(getOpts func() resourceOptions) {
+				options := getOpts()
+
 				Expect(options.validate()).To(Succeed())
 
 				resource := options.newResource()
 				Expect(resource.Validate()).To(Succeed())
 				Expect(resource.GVK.IsEqualTo(options.GVK)).To(BeTrue())
-				// Plural is checked in the next test
 				Expect(resource.Path).To(Equal(""))
 				Expect(resource.API).NotTo(BeNil())
 				Expect(resource.API.CRDVersion).To(Equal(""))
 				Expect(resource.API.Namespaced).To(BeFalse())
-				Expect(resource.Controller).To(BeFalse())
+				Expect(resource.HasController()).To(BeFalse())
 				Expect(resource.Webhooks).NotTo(BeNil())
 				Expect(resource.Webhooks.WebhookVersion).To(Equal(""))
 				Expect(resource.Webhooks.Defaulting).To(BeFalse())
 				Expect(resource.Webhooks.Validation).To(BeFalse())
 				Expect(resource.Webhooks.Conversion).To(BeFalse())
 			},
-			Entry("full GVK", resourceOptions{GVK: fullGVK}),
-			Entry("missing domain", resourceOptions{GVK: noDomainGVK}),
-			Entry("missing group", resourceOptions{GVK: noGroupGVK}),
+			Entry("full GVK", func() resourceOptions { return resourceOptions{GVK: fullGVK} }),
+			Entry("missing domain", func() resourceOptions { return resourceOptions{GVK: noDomainGVK} }),
+			Entry("missing group", func() resourceOptions { return resourceOptions{GVK: noGroupGVK} }),
 		)
 
 		DescribeTable("should default the Plural by pluralizing the Kind",
@@ -106,5 +113,50 @@ var _ = Describe("resourceOptions", func() {
 			Entry("for `Fish`", "Fish", "fish"),
 			Entry("for `Helmswoman`", "Helmswoman", "helmswomen"),
 		)
+	})
+
+	Context("resolveDomain", func() {
+		const externalDomain = "cert-manager.io"
+
+		external := func(d string) resource.Resource {
+			return resource.Resource{
+				GVK:      resource.GVK{Group: group, Domain: d, Version: version, Kind: kind},
+				External: true,
+			}
+		}
+
+		newCfg := func(tracked ...resource.Resource) *cfgv3.Cfg {
+			c := &cfgv3.Cfg{Version: cfgv3.Version, Domain: domain}
+			for _, r := range tracked {
+				Expect(c.AddResource(r)).To(Succeed())
+			}
+			return c
+		}
+
+		DescribeTable("keeps the project domain",
+			func(getCfg func() *cfgv3.Cfg) {
+				opts := resourceOptions{GVK: fullGVK}
+				Expect(opts.resolveDomain(getCfg())).To(Equal(domain))
+			},
+			Entry("when nothing is tracked", func() *cfgv3.Cfg { return newCfg() }),
+			Entry("when the exact GVK is tracked", func() *cfgv3.Cfg {
+				return newCfg(resource.Resource{GVK: fullGVK})
+			}),
+			Entry("when multiple G+V+K matches are ambiguous", func() *cfgv3.Cfg {
+				return newCfg(external(externalDomain), external("other-vendor.io"))
+			}),
+		)
+
+		It("adopts the stored external domain and flows it through newResource", func() {
+			opts := resourceOptions{GVK: fullGVK}
+			cfg := newCfg(external(externalDomain))
+
+			opts.Domain = opts.resolveDomain(cfg)
+			res := opts.newResource()
+
+			Expect(opts.Domain).To(Equal(externalDomain))
+			Expect(res.Domain).To(Equal(externalDomain))
+			Expect(res.QualifiedGroup()).To(Equal(group + "." + externalDomain))
+		})
 	})
 })

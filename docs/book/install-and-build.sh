@@ -23,7 +23,10 @@ THIS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 cd "$THIS_DIR"
 
-[[ -n "$(command -v gimme)" ]] && eval "$(gimme stable)"
+if [[ -n "$(command -v gimme)" ]]; then
+    GO_VERSION=${GO_VERSION:-stable}  # Use the provided GO_VERSION or default to 'stable'
+    eval "$(gimme $GO_VERSION)"
+fi
 echo go version
 GOBIN=$THIS_DIR/functions go install ./...
 
@@ -33,8 +36,8 @@ arch=$(go env GOARCH)
 # translate arch to rust's conventions (if we can)
 if [[ ${arch} == "amd64" ]]; then
     arch="x86_64"
-elif [[ ${arch} == "x86" ]]; then
-    arch="i686"
+elif [[ ${arch} == "arm64" ]]; then
+    arch="aarch64"
 fi
 
 # translate os to rust's conventions (if we can)
@@ -51,7 +54,7 @@ case ${os} in
         ;;
     linux)
         # works for linux, too
-        target="unknown-${os}-gnu"
+        target="unknown-${os}-musl"
         ;;
     *)
         target="unknown-${os}"
@@ -59,19 +62,25 @@ case ${os} in
 esac
 
 # grab mdbook
-# we hardcode linux/amd64 since rust uses a different naming scheme and it's a pain to tran
-echo "downloading mdBook-v0.4.2-${arch}-${target}.${ext}"
+MDBOOK_VERSION="v0.5.4"
+MDBOOK_BASENAME="mdBook-${MDBOOK_VERSION}-${arch}-${target}"
+MDBOOK_URL="https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/${MDBOOK_BASENAME}.${ext}"
+
+echo "downloading ${MDBOOK_BASENAME}.${ext} from ${MDBOOK_URL}"
 set -x
-curl -sL -o /tmp/mdbook.${ext} https://github.com/rust-lang-nursery/mdBook/releases/download/v0.4.2/mdBook-v0.4.2-${arch}-${target}.${ext}
+curl -fL -o /tmp/mdbook.${ext} "${MDBOOK_URL}"
 ${cmd} /tmp/mdbook.${ext}
 chmod +x /tmp/mdbook
 
-echo "grabbing the latest released controller-gen"
-go get sigs.k8s.io/controller-tools/cmd/controller-gen@v0.4.1
+CONTROLLER_GEN_VERSION="v0.23.0"
+
+echo "grabbing the controller-gen version: ${CONTROLLER_GEN_VERSION}"
+go version
+go install sigs.k8s.io/controller-tools/cmd/controller-gen@${CONTROLLER_GEN_VERSION}
 
 # make sure we add the go bin directory to our path
 gobin=$(go env GOBIN)
-gobin=${GOBIN:-$(go env GOPATH)/bin}  # GOBIN won't always be set :-/
+gobin=${gobin:-$(go env GOPATH)/bin} # GOBIN won't always be set :-/
 
 export PATH=${gobin}:$PATH
 verb=${1:-build}

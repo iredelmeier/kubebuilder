@@ -1,0 +1,1143 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v4
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/spf13/afero"
+	"github.com/spf13/pflag"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config/store/yaml"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
+	goPlugin "sigs.k8s.io/kubebuilder/v4/pkg/plugins/golang"
+)
+
+const (
+	crewGroup       = "crew"
+	testIO          = "test.io"
+	testCommandName = "kubebuilder"
+	captainKind     = "Captain"
+	captains        = "captains"
+	captainCtrl     = "captain"
+	captainBackup   = "captain-backup"
+	shipGroup       = "ship"
+	frigateKind     = "Frigate"
+	frigates        = "frigates"
+
+	externalAPIModuleWithVersion = "github.com/external/api@v1.0.0"
+	relativeAPIPath              = "api/v1"
+)
+
+var _ = Describe("createAPISubcommand", func() {
+	var (
+		subCmd *createAPISubcommand
+		cfg    config.Config
+		res    *resource.Resource
+	)
+
+	BeforeEach(func() {
+		subCmd = &createAPISubcommand{}
+		cfg = cfgv3.New()
+		_ = cfg.SetRepository("github.com/example/test")
+
+		subCmd.options = &goPlugin.Options{}
+		subCmd.resourceFlag = &pflag.Flag{Changed: true}
+		subCmd.controllerFlag = &pflag.Flag{Changed: true}
+		subCmd.ssaFlag = &pflag.Flag{}
+
+		res = &resource.Resource{
+			GVK: resource.GVK{
+				Group:   crewGroup,
+				Domain:  testIO,
+				Version: "v1",
+				Kind:    captainKind,
+			},
+			Plural:   captains,
+			API:      &resource.API{},
+			Webhooks: &resource.Webhooks{},
+		}
+
+		Expect(subCmd.InjectConfig(cfg)).To(Succeed())
+	})
+
+	Context("UpdateMetadata", func() {
+		It("should provide concise API examples", func() {
+			meta := &plugin.SubcommandMetadata{}
+
+			subCmd.UpdateMetadata(plugin.CLIMetadata{CommandName: testCommandName}, meta)
+
+			Expect(meta.Examples).To(ContainSubstring("kubebuilder create api --group crew --version v1 --kind Captain"))
+			Expect(meta.Examples).To(ContainSubstring("--namespaced=false --controller=false"))
+			Expect(meta.Examples).To(ContainSubstring("--external-api-path"))
+			Expect(meta.Examples).NotTo(ContainSubstring("nano "))
+		})
+	})
+
+	It("should reject external API options when creating API in project", func() {
+		subCmd.options.DoAPI = true
+		subCmd.options.ExternalAPIPath = "github.com/external/api"
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("cannot use '--external-api-path'"))
+	})
+
+	It("should reject --ssa when not creating an API resource (--resource=false)", func() {
+		subCmd.options.SSA = true
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(
+			"'--ssa' can only be used when creating an API resource ('--resource=true')"))
+	})
+
+	It("should allow --ssa when creating an API resource (--resource=true)", func() {
+		subCmd.options.SSA = true
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+
+		Expect(subCmd.InjectResource(res)).To(Succeed())
+		Expect(res.API.SSA).To(BeTrue())
+	})
+
+	DescribeTable("should keep the SSA value tracked in the PROJECT file",
+		func(storedSSA, flagSSA, expected bool) {
+			existing := *res
+			existing.API = &resource.API{CRDVersion: "v1", Namespaced: true, SSA: storedSSA}
+			Expect(cfg.AddResource(existing)).To(Succeed())
+
+			subCmd.force = true
+			subCmd.options.DoAPI = true
+			subCmd.options.Namespaced = true
+			subCmd.options.SSA = flagSSA
+
+			Expect(subCmd.InjectResource(res)).To(Succeed())
+			Expect(res.API.SSA).To(Equal(expected))
+		},
+		Entry("when the flag is not provided for an API scaffolded with SSA", true, false, true),
+		Entry("when the flag is provided for an API scaffolded with SSA", true, true, true),
+		Entry("when the flag is not provided for an API scaffolded without SSA", false, false, false),
+	)
+
+	It("should reject --ssa on a forced re-run of an API scaffolded without SSA", func() {
+		existing := *res
+		existing.API = &resource.API{CRDVersion: "v1", Namespaced: true}
+		Expect(cfg.AddResource(existing)).To(Succeed())
+
+		subCmd.force = true
+		subCmd.options.DoAPI = true
+		subCmd.options.Namespaced = true
+		subCmd.options.SSA = true
+		subCmd.ssaFlag.Changed = true
+
+		err := subCmd.InjectResource(res)
+		Expect(err).To(MatchError(ContainSubstring("unable to add '--ssa' to the existing API")))
+		saved, getErr := cfg.GetResource(res.GVK)
+		Expect(getErr).NotTo(HaveOccurred())
+		Expect(saved.API.SSA).To(BeFalse())
+	})
+
+	DescribeTable("should reject --ssa=false",
+		func(stored *resource.API) {
+			if stored != nil {
+				existing := *res
+				existing.API = stored
+				Expect(cfg.AddResource(existing)).To(Succeed())
+			}
+
+			subCmd.force = true
+			subCmd.options.DoAPI = true
+			subCmd.options.Namespaced = true
+			subCmd.options.SSA = false
+			subCmd.ssaFlag.Changed = true
+
+			err := subCmd.InjectResource(res)
+			Expect(err).To(MatchError(ContainSubstring("'--ssa=false' is not supported")))
+			if stored != nil {
+				saved, getErr := cfg.GetResource(res.GVK)
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(saved.API.SSA).To(Equal(stored.SSA))
+			}
+		},
+		Entry("for a new API", nil),
+		Entry("for an API scaffolded with SSA", &resource.API{CRDVersion: "v1", Namespaced: true, SSA: true}),
+		Entry("for an API scaffolded without SSA", &resource.API{CRDVersion: "v1", Namespaced: true}),
+	)
+
+	DescribeTable("should accept --ssa or no flag",
+		func(flagChanged, flagSSA bool) {
+			subCmd.options.DoAPI = true
+			subCmd.options.Namespaced = true
+			subCmd.options.SSA = flagSSA
+			subCmd.ssaFlag.Changed = flagChanged
+
+			Expect(subCmd.InjectResource(res)).To(Succeed())
+			Expect(res.API.SSA).To(Equal(flagSSA))
+		},
+		Entry("when the flag is not provided", false, false),
+		Entry("when --ssa is provided", true, true),
+	)
+
+	It("should not enable SSA for a new API when another one has it enabled", func() {
+		other := *res
+		other.Kind = frigateKind
+		other.Plural = frigates
+		other.API = &resource.API{CRDVersion: "v1", Namespaced: true, SSA: true}
+		Expect(cfg.AddResource(other)).To(Succeed())
+
+		subCmd.options.DoAPI = true
+		subCmd.options.Namespaced = true
+
+		Expect(subCmd.InjectResource(res)).To(Succeed())
+		Expect(res.API.SSA).To(BeFalse())
+	})
+
+	It("should not reject --resource=false for an API scaffolded with SSA", func() {
+		existing := *res
+		existing.API = &resource.API{CRDVersion: "v1", Namespaced: true, SSA: true}
+		Expect(cfg.AddResource(existing)).To(Succeed())
+
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+
+		Expect(subCmd.InjectResource(res)).To(Succeed())
+	})
+
+	It("should require external-api-path when using external-api-module", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.ExternalAPIModule = externalAPIModuleWithVersion
+		subCmd.options.ExternalAPIPath = ""
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("requires '--external-api-path'"))
+	})
+
+	It("should reject an invalid controller name before updating the resource", func() {
+		subCmd.options.DoController = true
+		subCmd.options.ControllerName = "Not_A_Label"
+		Expect(subCmd.InjectResource(res)).To(MatchError(ContainSubstring("invalid '--controller-name'")))
+		Expect(res.HasController()).To(BeFalse())
+	})
+
+	It("should validate an existing external controller using the requested API domain", func() {
+		existing := res.Copy()
+		existing.Domain = "external.io"
+		existing.External = true
+		existing.Path = "example.com/external/api/v1"
+		existing.API = nil
+		existing.Controllers = &resource.Controllers{{Name: captainCtrl}}
+		Expect(cfg.AddResource(existing)).To(Succeed())
+
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = existing.Path
+		subCmd.options.ExternalAPIDomain = existing.Domain
+		Expect(subCmd.InjectResource(res)).To(Succeed())
+		Expect(res.GVK).To(Equal(existing.GVK))
+	})
+
+	It("should reject external-api-path with module version", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = externalAPIModuleWithVersion
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("version specifiers belong in the module field"))
+	})
+
+	It("should reject bare relative external-api-path", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = relativeAPIPath
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("must be a fully-qualified Go import path"))
+	})
+
+	It("should reject bare domain external-api-path", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = "example.com"
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("must include a package sub-path"))
+	})
+
+	It("should reject leading-dot pseudo-domain external-api-path", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = ".com/org/repo/api/v1"
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("must be a fully-qualified Go import path"))
+	})
+
+	It("should reject malformed external-api-path", func() {
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = "a//b"
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("malformed import path"))
+		Expect(err.Error()).To(ContainSubstring("double slash"))
+	})
+
+	It("should allow adding a controller to existing external resource without re-providing --external-api-path", func() {
+		const externalPath = "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+		existingExternal := *res
+		existingExternal.External = true
+		existingExternal.Path = externalPath
+		Expect(cfg.AddResource(existingExternal)).To(Succeed())
+
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = ""
+		res.External = true
+		res.Path = externalPath
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should find existing external resource when stored Domain differs from project domain", func() {
+		const externalPath = "github.com/cert-manager/cert-manager/pkg/apis/certmanager/v1"
+		const externalDomain = "cert-manager.io"
+
+		// Simulate: resource originally scaffolded with --external-api-domain=cert-manager.io,
+		// so PROJECT stores Domain="cert-manager.io". A fresh CLI invocation without
+		// --external-api-domain runs resolveDomain up in cmd_helpers before the GVK reaches
+		// InjectResource, so by this point res.Domain has already been reconciled to the
+		// stored external domain — mirror that here.
+		existingExternal := *res
+		existingExternal.External = true
+		existingExternal.Path = externalPath
+		existingExternal.Domain = externalDomain
+		Expect(cfg.AddResource(existingExternal)).To(Succeed())
+
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = ""
+		res.Domain = externalDomain
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.External).To(BeTrue())
+		Expect(res.Path).To(Equal(externalPath))
+	})
+
+	Context("when several recorded resources share the Group/Version/Kind", func() {
+		const (
+			ioDomain    = "io"
+			k8sIODomain = "k8s.io"
+			ioPath      = "github.com/external/io/api/v1"
+			k8sIOPath   = "github.com/external/k8sio/api/v1"
+		)
+
+		BeforeEach(func() {
+			// A slice, not a map, so the recorded order (and the domains listed in errors) is fixed.
+			for _, variant := range []struct{ domain, path string }{
+				{ioDomain, ioPath},
+				{k8sIODomain, k8sIOPath},
+			} {
+				external := *res
+				external.Domain = variant.domain
+				external.External = true
+				external.Path = variant.path
+				external.API = nil
+				Expect(cfg.AddResource(external)).To(Succeed())
+			}
+
+			// resolveDomain keeps the project domain when several records match.
+			subCmd.options.DoAPI = false
+			subCmd.options.DoController = true
+		})
+
+		DescribeTable("should select the entry named by --external-api-domain",
+			func(externalPath string) {
+				subCmd.options.ExternalAPIDomain = k8sIODomain
+				subCmd.options.ExternalAPIPath = externalPath
+
+				Expect(subCmd.InjectResource(res)).To(Succeed())
+				Expect(res.Domain).To(Equal(k8sIODomain))
+				Expect(res.External).To(BeTrue())
+				Expect(res.Path).To(Equal(k8sIOPath))
+			},
+			Entry("without --external-api-path", ""),
+			Entry("with the recorded --external-api-path", k8sIOPath),
+		)
+
+		It("should refuse without --external-api-domain instead of adding a project-domain entry", func() {
+			err := subCmd.InjectResource(res)
+
+			Expect(err).To(MatchError(ContainSubstring("match more than one resource (domains: io, k8s.io)")))
+			Expect(err).To(MatchError(ContainSubstring("pass --external-api-domain")))
+			Expect(res.Domain).To(Equal(testIO))
+		})
+
+		It("should refuse an --external-api-domain that matches no recorded entry", func() {
+			subCmd.options.ExternalAPIDomain = "example.org"
+
+			err := subCmd.InjectResource(res)
+
+			Expect(err).To(MatchError(ContainSubstring(`no resource matches --external-api-domain "example.org"`)))
+		})
+
+		It("should add a new external variant when given a new domain and --external-api-path", func() {
+			const newPath = "github.com/external/org/api/v1"
+			subCmd.options.ExternalAPIDomain = "example.org"
+			subCmd.options.ExternalAPIPath = newPath
+
+			Expect(subCmd.InjectResource(res)).To(Succeed())
+			Expect(res.Domain).To(Equal("example.org"))
+			Expect(res.External).To(BeTrue())
+			Expect(res.Path).To(Equal(newPath))
+		})
+
+		It("should select the project API when one shares the Group/Version/Kind", func() {
+			project := *res
+			project.Path = resource.APIPackagePath(cfg.GetRepository(), res.Group, res.Version, false)
+			project.API = &resource.API{CRDVersion: "v1", Namespaced: true}
+			Expect(cfg.AddResource(project)).To(Succeed())
+
+			Expect(subCmd.InjectResource(res)).To(Succeed())
+			Expect(res.Domain).To(Equal(testIO))
+			Expect(res.External).To(BeFalse())
+			Expect(res.Path).To(Equal(project.Path))
+		})
+	})
+
+	It("should return an actionable error for --resource=false on old project with relative external path", func() {
+		// Simulate an old PROJECT file that stored a relative path instead of a Go import path
+		existingExternal := *res
+		existingExternal.External = true
+		existingExternal.Path = relativeAPIPath
+		Expect(cfg.AddResource(existingExternal)).To(Succeed())
+
+		subCmd.options.DoAPI = false
+		subCmd.options.DoController = true
+		subCmd.options.ExternalAPIPath = ""
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("invalid Path"))
+		Expect(err.Error()).To(ContainSubstring("must be a fully-qualified Go import path"))
+		Expect(err.Error()).To(ContainSubstring("github.com/org/repo/api/v1"))
+	})
+
+	It("should prevent duplicate API without force flag", func() {
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+
+		resWithAPI := *res
+		resWithAPI.API = &resource.API{CRDVersion: "v1"}
+		Expect(cfg.AddResource(resWithAPI)).To(Succeed())
+
+		subCmd.force = false
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("API resource already exists"))
+	})
+
+	It("should allow duplicate API with force flag", func() {
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+
+		resWithAPI := *res
+		resWithAPI.API = &resource.API{CRDVersion: "v1"}
+		Expect(cfg.AddResource(resWithAPI)).To(Succeed())
+
+		subCmd.force = true
+		err := subCmd.InjectResource(res)
+
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should prevent multiple groups in single-group project", func() {
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+
+		firstRes := resource.Resource{
+			GVK: resource.GVK{
+				Group:   shipGroup,
+				Domain:  testIO,
+				Version: "v1",
+				Kind:    frigateKind,
+			},
+			Plural: frigates,
+			API:    &resource.API{CRDVersion: "v1"},
+		}
+		Expect(cfg.AddResource(firstRes)).To(Succeed())
+
+		res.Group = crewGroup
+		res.Plural = captains
+
+		err := subCmd.InjectResource(res)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("multiple groups are not allowed"))
+	})
+
+	It("should allow multiple groups when multigroup is enabled", func() {
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+
+		Expect(cfg.SetMultiGroup()).To(Succeed())
+
+		firstRes := resource.Resource{
+			GVK: resource.GVK{
+				Group:   shipGroup,
+				Domain:  testIO,
+				Version: "v1",
+				Kind:    frigateKind,
+			},
+			Plural: frigates,
+			API:    &resource.API{CRDVersion: "v1"},
+		}
+		Expect(cfg.AddResource(firstRes)).To(Succeed())
+
+		res.Group = crewGroup
+
+		Expect(subCmd.InjectResource(res)).To(Succeed())
+	})
+
+	Context("with 2 versions of a kind that share the legacy controller", func() {
+		// Kubebuilder v4.13.0 records this when the second version is created with --force:
+		// both versions share one captain_controller.go and one CaptainReconciler.
+		BeforeEach(func() {
+			cfg.(*cfgv3.Cfg).Resources = []resource.Resource{
+				{
+					GVK:        resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: captainKind},
+					API:        &resource.API{CRDVersion: "v1", Namespaced: true},
+					Controller: true,
+				},
+				{
+					GVK:        resource.GVK{Group: crewGroup, Domain: testIO, Version: "v2", Kind: captainKind},
+					API:        &resource.API{CRDVersion: "v1", Namespaced: true},
+					Controller: true,
+				},
+			}
+			subCmd.options.DoAPI = true
+			subCmd.options.DoController = true
+		})
+
+		It("should create an API for another kind and save the project", func() {
+			res.Kind = "Sailor"
+			res.Plural = "sailors"
+
+			Expect(subCmd.InjectResource(res)).To(Succeed())
+			Expect(cfg.UpdateResource(*res)).To(Succeed())
+			_, err := cfg.MarshalYAML()
+			Expect(err).NotTo(HaveOccurred())
+		})
+	})
+
+	DescribeTable("should refuse the default controller of a new version beside another version's, "+
+		"before any file is written",
+		func(force bool) {
+			Expect(cfg.AddResource(resource.Resource{
+				GVK:         resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: captainKind},
+				API:         &resource.API{CRDVersion: "v1", Namespaced: true},
+				Controllers: &resource.Controllers{{Name: resource.DefaultControllerName(captainKind)}},
+			})).To(Succeed())
+			before, err := cfg.GetResources()
+			Expect(err).NotTo(HaveOccurred())
+
+			subCmd.options.DoAPI = true
+			subCmd.options.DoController = true
+			subCmd.force = force
+			res.Version = "v2"
+
+			err = subCmd.InjectResource(res)
+			Expect(err).To(MatchError(ContainSubstring("both generate CaptainReconciler")))
+			Expect(cfg.GetResources()).To(Equal(before))
+		},
+		Entry("without --force", false),
+		Entry("with --force", true),
+	)
+
+	It("should refuse a default name used by another kind", func() {
+		Expect(cfg.AddResource(resource.Resource{
+			GVK:         resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: captainKind},
+			API:         &resource.API{CRDVersion: "v1", Namespaced: true},
+			Controllers: &resource.Controllers{{Name: captainBackup}},
+		})).To(Succeed())
+
+		subCmd.options.DoAPI = true
+		subCmd.options.DoController = true
+		res.Kind = "CaptainBackup"
+		res.Plural = "captainbackups"
+
+		err := subCmd.InjectResource(res)
+		Expect(err).To(MatchError(ContainSubstring("both generate CaptainBackupReconciler")))
+	})
+})
+
+var _ = Describe("validateController", func() {
+	var (
+		cfg config.Config
+		gvk resource.GVK
+	)
+
+	BeforeEach(func() {
+		cfg = cfgv3.New()
+		Expect(cfg.SetRepository("test")).To(Succeed())
+		gvk = resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: captainKind}
+	})
+
+	stored := func(controllers *resource.Controllers, legacy bool) {
+		res := resource.Resource{GVK: gvk, Plural: captains, Controllers: controllers}
+		res.Controller = legacy //nolint:staticcheck // simulating an unmigrated PROJECT file
+		Expect(cfg.AddResource(res)).To(Succeed())
+	}
+
+	subcommand := func(name string, doAPI bool) *createAPISubcommand {
+		return &createAPISubcommand{
+			config:   cfg,
+			resource: &resource.Resource{GVK: gvk, Plural: captains},
+			options:  &goPlugin.Options{DoController: true, ControllerName: name, DoAPI: doAPI},
+		}
+	}
+
+	It("should skip validation when no controller is requested", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}}, false)
+		p := subcommand("", false)
+		p.options.DoController = false
+
+		Expect(p.validateController()).To(Succeed())
+	})
+
+	It("should accept any name when the resource does not exist yet", func() {
+		Expect(subcommand(captainBackup, false).validateController()).To(Succeed())
+	})
+
+	It("should accept a new name on a resource that already has controllers", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}}, false)
+
+		Expect(subcommand(captainBackup, false).validateController()).To(Succeed())
+	})
+
+	It("should reject a name already recorded", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}}, false)
+
+		Expect(subcommand(captainCtrl, false).validateController()).NotTo(Succeed())
+	})
+
+	It("should reject a name already recorded through the legacy field", func() {
+		stored(nil, true)
+
+		Expect(subcommand(captainCtrl, false).validateController()).NotTo(Succeed())
+	})
+
+	It("should reject a name generating an existing reconciler", func() {
+		stored(&resource.Controllers{{Name: captainBackup}}, false)
+
+		Expect(subcommand("captain--backup", false).validateController()).NotTo(Succeed())
+	})
+
+	It("should allow re-scaffolding the single default controller without a name", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}}, false)
+
+		Expect(subcommand("", false).validateController()).To(Succeed())
+	})
+
+	It("should require a name when the resource has several controllers", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}, {Name: captainBackup}}, false)
+
+		Expect(subcommand("", false).validateController()).NotTo(Succeed())
+	})
+
+	It("should require a name when the only controller is not the default", func() {
+		stored(&resource.Controllers{{Name: captainBackup}}, false)
+
+		Expect(subcommand("", false).validateController()).NotTo(Succeed())
+	})
+
+	It("should allow omitting the name while recreating the API", func() {
+		stored(&resource.Controllers{{Name: captainCtrl}, {Name: captainBackup}}, false)
+
+		Expect(subcommand("", true).validateController()).To(Succeed())
+	})
+})
+
+var _ = Describe("validateController across resources", func() {
+	const (
+		admiralCtrl   = "admiral"
+		admiralKind   = "Admiral"
+		admiralPlural = "admirals"
+	)
+
+	var (
+		cfg        config.Config
+		captainGVK resource.GVK
+	)
+
+	BeforeEach(func() {
+		cfg = cfgv3.New()
+		Expect(cfg.SetRepository("test")).To(Succeed())
+		captainGVK = resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: captainKind}
+
+		Expect(cfg.AddResource(resource.Resource{
+			GVK:         resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: admiralKind},
+			Plural:      admiralPlural,
+			Controllers: &resource.Controllers{{Name: admiralCtrl}},
+		})).To(Succeed())
+	})
+
+	subcommand := func(name string) *createAPISubcommand {
+		return &createAPISubcommand{
+			config:   cfg,
+			resource: &resource.Resource{GVK: captainGVK, Plural: captains},
+			options:  &goPlugin.Options{DoController: true, ControllerName: name},
+		}
+	}
+
+	It("should reject a name generating another resource's reconciler", func() {
+		err := subcommand(admiralCtrl).validateController()
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("AdmiralReconciler"))
+		Expect(err.Error()).To(ContainSubstring("--controller-name"))
+	})
+
+	It("should accept a name that does not collide", func() {
+		Expect(subcommand(captainBackup).validateController()).To(Succeed())
+	})
+
+	It("should fail when the resources cannot be listed", func() {
+		p := subcommand(captainBackup)
+		p.config = failingResourcesConfig{Config: cfg}
+
+		Expect(p.validateController()).To(MatchError(ContainSubstring("resources unavailable")))
+	})
+
+	It("should reject a shared filename even when reconciler capitalization differs", func() {
+		existing := resource.Resource{
+			GVK:    resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: "MyKind"},
+			Plural: "mykinds", Controllers: &resource.Controllers{{Name: "mykind"}},
+		}
+		Expect(cfg.AddResource(existing)).To(Succeed())
+		Expect(subcommand("mykind").validateController()).To(
+			MatchError(ContainSubstring("mykind_controller.go")))
+	})
+
+	It("should reject the default name when another version of the kind already has it", func() {
+		p := subcommand("")
+		p.resource = &resource.Resource{
+			GVK:    resource.GVK{Group: crewGroup, Domain: testIO, Version: "v2", Kind: admiralKind},
+			Plural: admiralPlural,
+		}
+
+		err := p.validateController()
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("AdmiralReconciler"))
+	})
+
+	It("should accept a second version of a kind that names its controller", func() {
+		p := subcommand("admiral-v2")
+		p.resource = &resource.Resource{
+			GVK:    resource.GVK{Group: crewGroup, Domain: testIO, Version: "v2", Kind: admiralKind},
+			Plural: admiralPlural,
+		}
+
+		Expect(p.validateController()).To(Succeed())
+	})
+
+	It("should allow the same name in another group of a multigroup project", func() {
+		Expect(cfg.SetMultiGroup()).To(Succeed())
+		p := subcommand(admiralCtrl)
+		p.resource.Group = shipGroup
+
+		Expect(p.validateController()).To(Succeed())
+	})
+
+	It("should still reject it within the same group of a multigroup project", func() {
+		Expect(cfg.SetMultiGroup()).To(Succeed())
+
+		Expect(subcommand(admiralCtrl).validateController()).NotTo(Succeed())
+	})
+})
+
+var _ = Describe("default controller name", func() {
+	// Kinds and default controller names use the same DNS-1035 validation rules.
+	DescribeTable("should be valid for every kind GVK.Validate accepts",
+		func(kind string) {
+			gvk := resource.GVK{Group: crewGroup, Domain: testIO, Version: "v1", Kind: kind}
+			Expect(gvk.Validate()).To(Succeed())
+
+			name := resource.DefaultControllerName(kind)
+			Expect(resource.Controller{Name: name}.Validate()).To(Succeed())
+		},
+		Entry("a short kind", captainKind),
+		Entry("a kind with digits", "Captain2"),
+		Entry("a kind at the 63 character limit", "C"+strings.Repeat("a", 62)),
+	)
+})
+
+// failingResourcesConfig is a config whose resources cannot be listed.
+type failingResourcesConfig struct {
+	config.Config
+}
+
+func (failingResourcesConfig) GetResources() ([]resource.Resource, error) {
+	return nil, errors.New("resources unavailable")
+}
+
+var _ = Describe("create api on a PROJECT file", func() {
+	const (
+		admiralKind   = "Admiral"
+		firstMateKind = "FirstMate"
+		sharedCtrl    = "shared"
+		nameFlag      = "--controller-name"
+		noAPIFlag     = "--resource=false"
+	)
+
+	// mainFile holds the markers create api inserts the new types and controllers at.
+	const mainFile = `package main
+
+import (
+	// +kubebuilder:scaffold:imports
+)
+
+func init() {
+	// +kubebuilder:scaffold:scheme
+}
+
+func main() {
+	// +kubebuilder:scaffold:builder
+}
+`
+
+	// backupFile stands for a controller the user already implemented.
+	const backupFile = `package controller
+
+// implemented by the user
+`
+
+	// PROJECT files are written as text so that the form older releases wrote stays covered.
+	const (
+		// projectTemplate is a PROJECT file. The placeholders hold the multigroup line, if any, and
+		// the resources, if any.
+		projectTemplate = `domain: test.io
+layout:
+- go.kubebuilder.io/v4
+%sprojectName: test
+repo: github.com/example/test
+%sversion: "3"
+`
+		multiGroupLine = `multigroup: true
+`
+		resourcesLine = `resources:
+`
+		// resourceTemplate is a resource of a PROJECT file. The placeholders hold its controller
+		// lines, if any, and its group, kind, API path and version.
+		resourceTemplate = `- api:
+    crdVersion: v1
+    namespaced: true
+%s  domain: test.io
+  group: %s
+  kind: %s
+  path: %s
+  version: %s
+`
+		// legacy is the controller line older releases wrote.
+		legacy = `  controller: true
+`
+		// controllersLine starts the controllers of a resource; each one is a controllerTemplate.
+		controllersLine = `  controllers:
+`
+		controllerTemplate = `  - name: %s
+`
+	)
+
+	var (
+		fs         machinery.Filesystem
+		multiGroup bool
+	)
+
+	BeforeEach(func() {
+		fs = machinery.Filesystem{FS: afero.NewMemMapFs()}
+		multiGroup = false
+	})
+
+	// named returns the controller lines of a resource that records its controllers by name.
+	named := func(names ...string) string {
+		lines := controllersLine
+		for _, name := range names {
+			lines += fmt.Sprintf(controllerTemplate, name)
+		}
+		return lines
+	}
+
+	// entry returns a resource of the PROJECT file; controllers holds its controller lines, if any.
+	entry := func(group, version, kind, controllers string) string {
+		path := "github.com/example/test/api/" + version
+		if multiGroup {
+			path = "github.com/example/test/api/" + group + "/" + version
+		}
+		return fmt.Sprintf(resourceTemplate, controllers, group, kind, path, version)
+	}
+
+	// writeProject writes a PROJECT file with the given resources and the main file create api updates.
+	writeProject := func(resources ...string) {
+		GinkgoHelper()
+		multi, list := "", ""
+		if multiGroup {
+			multi = multiGroupLine
+		}
+		if len(resources) > 0 {
+			list = resourcesLine + strings.Join(resources, "")
+		}
+		content := fmt.Sprintf(projectTemplate, multi, list)
+		Expect(afero.WriteFile(fs.FS, "PROJECT", []byte(content), 0o644)).To(Succeed())
+		Expect(afero.WriteFile(fs.FS, DefaultMainPath, []byte(mainFile), 0o644)).To(Succeed())
+	}
+
+	// createAPI runs the create api hooks in the order the CLI runs them: load the PROJECT file,
+	// inject the config and the resource, scaffold the files, then save the PROJECT file.
+	// --resource and --controller default to true; later arguments override them.
+	createAPI := func(group, version, kind string, args ...string) error {
+		s := yaml.New(fs)
+		Expect(s.Load()).To(Succeed())
+
+		p := &createAPISubcommand{}
+		flags := pflag.NewFlagSet("create api", pflag.ContinueOnError)
+		p.BindFlags(flags)
+		Expect(flags.Parse(append([]string{"--resource=true", "--controller=true", "--make=false"}, args...))).
+			To(Succeed())
+		Expect(p.InjectConfig(s.Config())).To(Succeed())
+
+		res := &resource.Resource{
+			GVK:      resource.GVK{Group: group, Domain: s.Config().GetDomain(), Version: version, Kind: kind},
+			Plural:   resource.RegularPlural(kind),
+			API:      &resource.API{},
+			Webhooks: &resource.Webhooks{},
+		}
+		if err := p.InjectResource(res); err != nil {
+			return err
+		}
+		if err := p.Scaffold(fs); err != nil {
+			return err
+		}
+		return s.Save()
+	}
+
+	// files returns every file of the project with its content.
+	files := func() map[string]string {
+		GinkgoHelper()
+		all := map[string]string{}
+		Expect(afero.Walk(fs.FS, ".", func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			content, readErr := afero.ReadFile(fs.FS, path)
+			Expect(readErr).NotTo(HaveOccurred())
+			all[path] = string(content)
+			return nil
+		})).To(Succeed())
+		return all
+	}
+
+	// loadProject returns the configuration the PROJECT file holds.
+	loadProject := func() config.Config {
+		GinkgoHelper()
+		s := yaml.New(fs)
+		Expect(s.Load()).To(Succeed())
+		return s.Config()
+	}
+
+	// controllersOf returns the controller names the PROJECT file records for a resource, checking
+	// that the legacy field was not written.
+	controllersOf := func(group, version, kind string) []string {
+		GinkgoHelper()
+		res, err := loadProject().GetResource(resource.GVK{Group: group, Domain: testIO, Version: version, Kind: kind})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.Controller).To(BeFalse(), //nolint:staticcheck // legacy field
+			"the legacy field must not be written")
+		return res.GetControllerNames()
+	}
+
+	controllerFile := func(name string) string {
+		return filepath.Join("internal", "controller", name+"_controller.go")
+	}
+
+	Context("in a project that records controllers by name", func() {
+		DescribeTable("should record the controller it scaffolds",
+			func(multi bool, args, recorded []string) {
+				multiGroup = multi
+				writeProject()
+
+				Expect(createAPI(crewGroup, "v1", captainKind, args...)).To(Succeed())
+
+				Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal(recorded))
+			},
+			Entry("the default name when no name is given", false, nil, []string{captainCtrl}),
+			Entry("only the given name", false, []string{nameFlag, captainBackup}, []string{captainBackup}),
+			Entry("no controller when none is requested", false, []string{"--controller=false"}, nil),
+			Entry("the default name in a multigroup project", true, nil, []string{captainCtrl}),
+		)
+
+		It("should record the default controller once when create api --force is repeated", func() {
+			writeProject()
+			Expect(createAPI(crewGroup, "v1", captainKind)).To(Succeed())
+			first, err := loadProject().GetResources()
+			Expect(err).NotTo(HaveOccurred())
+
+			Expect(createAPI(crewGroup, "v1", captainKind, "--force")).To(Succeed())
+			Expect(createAPI(crewGroup, "v1", captainKind, "--force")).To(Succeed())
+
+			Expect(loadProject().GetResources()).To(Equal(first))
+			Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal([]string{captainCtrl}))
+		})
+
+		It("should allow the same name in different groups of a multigroup project", func() {
+			multiGroup = true
+			writeProject(entry(crewGroup, "v1", admiralKind, named(sharedCtrl)))
+
+			Expect(createAPI(shipGroup, "v1", frigateKind, nameFlag, sharedCtrl)).To(Succeed())
+
+			Expect(controllersOf(crewGroup, "v1", admiralKind)).To(Equal([]string{sharedCtrl}))
+			Expect(controllersOf(shipGroup, "v1", frigateKind)).To(Equal([]string{sharedCtrl}))
+			Expect(files()).To(HaveKey(filepath.Join("internal", "controller", shipGroup, "shared_controller.go")))
+		})
+	})
+
+	Context("in a project scaffolded by an older release", func() {
+		It("should record the legacy controller by name when a new API is added", func() {
+			writeProject(entry(crewGroup, "v1", captainKind, legacy))
+
+			Expect(createAPI(crewGroup, "v1", admiralKind)).To(Succeed())
+
+			Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal([]string{captainCtrl}))
+			Expect(controllersOf(crewGroup, "v1", admiralKind)).To(Equal([]string{"admiral"}))
+		})
+
+		It("should record the legacy controller once when it is scaffolded again without a name", func() {
+			writeProject(entry(crewGroup, "v1", captainKind, legacy))
+
+			Expect(createAPI(crewGroup, "v1", captainKind, noAPIFlag)).To(Succeed())
+
+			Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal([]string{captainCtrl}))
+		})
+
+		It("should keep the legacy controller when a named one is added", func() {
+			writeProject(entry(crewGroup, "v1", captainKind, legacy))
+
+			Expect(createAPI(crewGroup, "v1", captainKind, noAPIFlag, nameFlag, captainBackup)).
+				To(Succeed())
+
+			Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal([]string{captainCtrl, captainBackup}))
+			Expect(files()).To(HaveKey(controllerFile("captain_backup")))
+		})
+	})
+
+	DescribeTable("should recreate only the default controller with create api --force and no name",
+		func(controllers string, recorded []string) {
+			writeProject(entry(crewGroup, "v1", captainKind, controllers))
+			Expect(afero.WriteFile(fs.FS, controllerFile("captain_backup"), []byte(backupFile), 0o644)).To(Succeed())
+
+			Expect(createAPI(crewGroup, "v1", captainKind, "--force")).To(Succeed())
+
+			all := files()
+			Expect(all[controllerFile("captain_backup")]).To(Equal(backupFile))
+			Expect(all[controllerFile(captainCtrl)]).To(ContainSubstring("type CaptainReconciler struct"))
+			Expect(controllersOf(crewGroup, "v1", captainKind)).To(Equal(recorded))
+		},
+		Entry("in a project scaffolded by an older release", legacy+named(captainBackup),
+			[]string{captainBackup, captainCtrl}),
+		Entry("in a project that records controllers by name", named(captainCtrl, captainBackup),
+			[]string{captainCtrl, captainBackup}),
+	)
+
+	// Each case runs with and without --force: --force allows recreating an API, never a controller clash.
+	DescribeTable("should refuse a controller clash before writing any file",
+		func(existing, group, version, kind string, args []string, expected string) {
+			for _, force := range []bool{false, true} {
+				writeProject(existing)
+				before := files()
+				runArgs := args
+				if force {
+					runArgs = append(slices.Clone(args), "--force")
+				}
+
+				Expect(createAPI(group, version, kind, runArgs...)).To(MatchError(ContainSubstring(expected)),
+					"with --force=%t", force)
+				Expect(files()).To(Equal(before), "with --force=%t", force)
+			}
+		},
+		Entry("the same name on 2 kinds",
+			entry(crewGroup, "v1", admiralKind, named(sharedCtrl)), crewGroup, "v1", captainKind,
+			[]string{nameFlag, sharedCtrl}, "both generate SharedReconciler"),
+		Entry("the default name on 2 versions of a kind",
+			entry(crewGroup, "v1", captainKind, named(captainCtrl)), crewGroup, "v2", captainKind,
+			nil, "both generate CaptainReconciler"),
+		Entry("a legacy default on another version of a kind",
+			entry(crewGroup, "v1", captainKind, legacy), crewGroup, "v2", captainKind,
+			nil, "both generate CaptainReconciler"),
+		Entry("a name generating the default reconciler of another kind",
+			entry(crewGroup, "v1", captainKind, named("first-mate")), crewGroup, "v1", firstMateKind,
+			nil, "both generate FirstMateReconciler"),
+		Entry("a name already recorded for the resource",
+			entry(crewGroup, "v1", captainKind, named(captainBackup)), crewGroup, "v1", captainKind,
+			[]string{noAPIFlag, nameFlag, captainBackup}, "already exists"),
+		Entry("a name generating a reconciler of the resource",
+			entry(crewGroup, "v1", captainKind, named(captainBackup)), crewGroup, "v1", captainKind,
+			[]string{noAPIFlag, nameFlag, "captain--backup"}, "both generate CaptainBackupReconciler"),
+		Entry("the legacy default given by name",
+			entry(crewGroup, "v1", captainKind, legacy), crewGroup, "v1", captainKind,
+			[]string{noAPIFlag, nameFlag, captainCtrl}, "already exists"),
+		Entry("a name that is not a DNS label",
+			entry(crewGroup, "v1", captainKind, named(captainCtrl)), crewGroup, "v1", captainKind,
+			[]string{noAPIFlag, nameFlag, "Captain_Backup"}, "invalid '--controller-name'"),
+	)
+})

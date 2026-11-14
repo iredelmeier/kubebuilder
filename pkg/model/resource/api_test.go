@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,8 +17,7 @@ limitations under the License.
 package resource
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -45,14 +44,17 @@ var _ = Describe("API", func() {
 			Expect(api.Update(nil)).To(Succeed())
 			Expect(api.CRDVersion).To(Equal(""))
 			Expect(api.Namespaced).To(BeFalse())
+			Expect(api.SSA).To(BeFalse())
 
 			api = API{
 				CRDVersion: v1,
 				Namespaced: true,
+				SSA:        true,
 			}
 			Expect(api.Update(nil)).To(Succeed())
 			Expect(api.CRDVersion).To(Equal(v1))
 			Expect(api.Namespaced).To(BeTrue())
+			Expect(api.SSA).To(BeTrue())
 		})
 
 		Context("CRD version", func() {
@@ -79,7 +81,7 @@ var _ = Describe("API", func() {
 
 			It("should fail if previously set and provided CRD versions do not match", func() {
 				api = API{CRDVersion: v1}
-				other = API{CRDVersion: "v1beta1"}
+				other = API{CRDVersion: v1beta1}
 				Expect(api.Update(&other)).NotTo(Succeed())
 			})
 		})
@@ -113,11 +115,48 @@ var _ = Describe("API", func() {
 				Expect(api.Namespaced).To(BeFalse())
 			})
 		})
+
+		Context("SSA", func() {
+			It("should enable SSA if provided and not previously set", func() {
+				api = API{}
+				other = API{SSA: true}
+				Expect(api.Update(&other)).To(Succeed())
+				Expect(api.SSA).To(BeTrue())
+			})
+
+			It("should keep SSA enabled if previously set", func() {
+				api = API{SSA: true}
+
+				By("not providing it")
+				other = API{}
+				Expect(api.Update(&other)).To(Succeed())
+				Expect(api.SSA).To(BeTrue())
+
+				By("providing it")
+				other = API{SSA: true}
+				Expect(api.Update(&other)).To(Succeed())
+				Expect(api.SSA).To(BeTrue())
+			})
+
+			It("should not enable SSA if not provided and not previously set", func() {
+				api = API{}
+				other = API{}
+				Expect(api.Update(&other)).To(Succeed())
+				Expect(api.SSA).To(BeFalse())
+			})
+		})
 	})
 
 	Context("IsEmpty", func() {
 		var (
-			none    = API{}
+			none       API
+			cluster    API
+			namespaced API
+			ssa        API
+		)
+
+		BeforeEach(func() {
+			none = API{}
 			cluster = API{
 				CRDVersion: v1,
 			}
@@ -125,16 +164,22 @@ var _ = Describe("API", func() {
 				CRDVersion: v1,
 				Namespaced: true,
 			}
-		)
+			ssa = API{
+				SSA: true,
+			}
+		})
 
 		It("should return true fo an empty object", func() {
 			Expect(none.IsEmpty()).To(BeTrue())
 		})
 
 		DescribeTable("should return false for non-empty objects",
-			func(api API) { Expect(api.IsEmpty()).To(BeFalse()) },
-			Entry("cluster-scope", cluster),
-			Entry("namespace-scope", namespaced),
+			func(getAPI func() API) {
+				Expect(getAPI().IsEmpty()).To(BeFalse())
+			},
+			Entry("cluster-scope", func() API { return cluster }),
+			Entry("namespace-scope", func() API { return namespaced }),
+			Entry("ssa-only", func() API { return ssa }),
 		)
 	})
 })

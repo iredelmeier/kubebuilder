@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -31,9 +31,14 @@ func TestConfigStore(t *testing.T) {
 
 var _ = Describe("LoadError", func() {
 	var (
-		wrapped = fmt.Errorf("error message")
-		err     = LoadError{Err: wrapped}
+		wrapped error
+		err     LoadError
 	)
+
+	BeforeEach(func() {
+		wrapped = fmt.Errorf("error message")
+		err = LoadError{Err: wrapped}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -50,9 +55,14 @@ var _ = Describe("LoadError", func() {
 
 var _ = Describe("SaveError", func() {
 	var (
-		wrapped = fmt.Errorf("error message")
-		err     = SaveError{Err: wrapped}
+		wrapped error
+		err     SaveError
 	)
+
+	BeforeEach(func() {
+		wrapped = fmt.Errorf("error message")
+		err = SaveError{Err: wrapped}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {

@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,13 @@ limitations under the License.
 package plugin
 
 import (
-	"sort"
+	"slices"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/stage"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/stage"
 )
 
 var _ = Describe("Bundle", func() {
@@ -32,7 +32,16 @@ var _ = Describe("Bundle", func() {
 	)
 
 	var (
-		version = Version{Number: 1}
+		v Version
+
+		p1 mockPlugin
+		p2 mockPlugin
+		p3 mockPlugin
+		p4 mockPlugin
+	)
+
+	BeforeEach(func() {
+		v = Version{Number: 1}
 
 		p1 = mockPlugin{supportedProjectVersions: []config.Version{
 			{Number: 1},
@@ -53,7 +62,7 @@ var _ = Describe("Bundle", func() {
 			{Number: 2},
 			{Number: 3},
 		}}
-	)
+	})
 
 	Context("NewBundle", func() {
 		It("should succeed for plugins with common supported project versions", func() {
@@ -67,17 +76,20 @@ var _ = Describe("Bundle", func() {
 				{p1, p2, p3},
 				{p1, p3, p4},
 			} {
-				b, err := NewBundle(name, version, plugins...)
+
+				b, err := NewBundleWithOptions(WithName(name),
+					WithVersion(v),
+					WithPlugins(plugins...))
 				Expect(err).NotTo(HaveOccurred())
 				Expect(b.Name()).To(Equal(name))
-				Expect(b.Version().Compare(version)).To(Equal(0))
+				Expect(b.Version().Compare(v)).To(Equal(0))
 				versions := b.SupportedProjectVersions()
-				sort.Slice(versions, func(i int, j int) bool {
-					return versions[i].Compare(versions[j]) == -1
+				slices.SortStableFunc(versions, func(a, b config.Version) int {
+					return a.Compare(b)
 				})
 				expectedVersions := CommonSupportedProjectVersions(plugins...)
-				sort.Slice(expectedVersions, func(i int, j int) bool {
-					return expectedVersions[i].Compare(expectedVersions[j]) == -1
+				slices.SortStableFunc(expectedVersions, func(a, b config.Version) int {
+					return a.Compare(b)
 				})
 				Expect(versions).To(Equal(expectedVersions))
 				Expect(b.Plugins()).To(Equal(plugins))
@@ -88,17 +100,21 @@ var _ = Describe("Bundle", func() {
 			var a, b Bundle
 			var err error
 			plugins := []Plugin{p1, p2, p3}
-			a, err = NewBundle("a", version, p1, p2)
+			a, err = NewBundleWithOptions(WithName("a"),
+				WithVersion(v),
+				WithPlugins(p1, p2))
 			Expect(err).NotTo(HaveOccurred())
-			b, err = NewBundle("b", version, a, p3)
+			b, err = NewBundleWithOptions(WithName("b"),
+				WithVersion(v),
+				WithPlugins(a, p3))
 			Expect(err).NotTo(HaveOccurred())
 			versions := b.SupportedProjectVersions()
-			sort.Slice(versions, func(i int, j int) bool {
-				return versions[i].Compare(versions[j]) == -1
+			slices.SortStableFunc(versions, func(a, b config.Version) int {
+				return a.Compare(b)
 			})
 			expectedVersions := CommonSupportedProjectVersions(plugins...)
-			sort.Slice(expectedVersions, func(i int, j int) bool {
-				return expectedVersions[i].Compare(expectedVersions[j]) == -1
+			slices.SortStableFunc(expectedVersions, func(a, b config.Version) int {
+				return a.Compare(b)
 			})
 			Expect(versions).To(Equal(expectedVersions))
 			Expect(b.Plugins()).To(Equal(plugins))
@@ -113,9 +129,118 @@ var _ = Describe("Bundle", func() {
 
 				{p1, p2, p3, p4},
 			} {
-				_, err := NewBundle(name, version, plugins...)
+				_, err := NewBundleWithOptions(WithName(name),
+					WithVersion(v),
+					WithPlugins(plugins...))
+
 				Expect(err).To(HaveOccurred())
 			}
+		})
+	})
+
+	Context("NewBundleWithOptions", func() {
+		It("should succeed for plugins with common supported project versions", func() {
+			for _, plugins := range [][]Plugin{
+				{p1, p2},
+				{p1, p3},
+				{p1, p4},
+				{p2, p3},
+				{p3, p4},
+
+				{p1, p2, p3},
+				{p1, p3, p4},
+			} {
+				b, err := NewBundleWithOptions(WithName(name),
+					WithVersion(v),
+					WithDeprecationMessage(""),
+					WithPlugins(plugins...),
+				)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(b.Name()).To(Equal(name))
+				Expect(b.Version().Compare(v)).To(Equal(0))
+				versions := b.SupportedProjectVersions()
+				slices.SortStableFunc(versions, func(a, b config.Version) int {
+					return a.Compare(b)
+				})
+				expectedVersions := CommonSupportedProjectVersions(plugins...)
+				slices.SortStableFunc(expectedVersions, func(a, b config.Version) int {
+					return a.Compare(b)
+				})
+				Expect(versions).To(Equal(expectedVersions))
+				Expect(b.Plugins()).To(Equal(plugins))
+			}
+		})
+
+		It("should accept bundles as input", func() {
+			var a, b Bundle
+			var err error
+			plugins := []Plugin{p1, p2, p3}
+			a, err = NewBundleWithOptions(WithName("a"),
+				WithVersion(v),
+				WithDeprecationMessage(""),
+				WithPlugins(p1, p2),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			b, err = NewBundleWithOptions(WithName("b"),
+				WithVersion(v),
+				WithDeprecationMessage(""),
+				WithPlugins(a, p3),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			versions := b.SupportedProjectVersions()
+			slices.SortStableFunc(versions, func(a, b config.Version) int {
+				return a.Compare(b)
+			})
+			expectedVersions := CommonSupportedProjectVersions(plugins...)
+			slices.SortStableFunc(expectedVersions, func(a, b config.Version) int {
+				return a.Compare(b)
+			})
+			Expect(versions).To(Equal(expectedVersions))
+			Expect(b.Plugins()).To(Equal(plugins))
+		})
+
+		It("should fail for plugins with no common supported project version", func() {
+			for _, plugins := range [][]Plugin{
+				{p2, p4},
+
+				{p1, p2, p4},
+				{p2, p3, p4},
+
+				{p1, p2, p3, p4},
+			} {
+				_, err := NewBundleWithOptions(WithName(name),
+					WithVersion(v),
+					WithDeprecationMessage(""),
+					WithPlugins(plugins...),
+				)
+				Expect(err).To(HaveOccurred())
+			}
+		})
+
+		It("should store and return the deprecation warning", func() {
+			deprecationMsg := "This bundle is deprecated, please use v2"
+			b, err := NewBundleWithOptions(
+				WithName(name),
+				WithVersion(v),
+				WithDeprecationMessage(deprecationMsg),
+				WithPlugins(p1),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			deprecated, ok := b.(Deprecated)
+			Expect(ok).To(BeTrue())
+			Expect(deprecated.DeprecationWarning()).To(Equal(deprecationMsg))
+		})
+
+		It("should return empty string when no deprecation warning is set", func() {
+			b, err := NewBundleWithOptions(
+				WithName(name),
+				WithVersion(v),
+				WithPlugins(p1),
+			)
+			Expect(err).NotTo(HaveOccurred())
+			deprecated, ok := b.(Deprecated)
+			Expect(ok).To(BeTrue())
+			Expect(deprecated.DeprecationWarning()).To(BeEmpty())
 		})
 	})
 })

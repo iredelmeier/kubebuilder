@@ -1,0 +1,203 @@
+name: Helm Testdata Sample
+
+on:
+  push:
+    paths:
+      - "testdata/project-v4-with-plugins/**"
+      - ".github/workflows/test-helm-samples.yml"
+  pull_request:
+    paths:
+      - "testdata/project-v4-with-plugins/**"
+      - ".github/workflows/test-helm-samples.yml"
+
+permissions: {}
+
+jobs:
+  helm-test-project-v4-with-plugins:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    # Runs the same steps as the scaffolded test-chart.yml
+    defaults:
+      run:
+        working-directory: testdata/project-v4-with-plugins
+    env:
+      IMG: controller:latest
+      CERT_MANAGER_VERSION: v1.21.3
+      PROMETHEUS_OPERATOR_CRDS_VERSION: 32.0.2
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable Prometheus in kustomize (testdata sample)
+        run: |
+          sed -i 's/^#- \.\.\/prometheus/- ..\/prometheus/' config/default/kustomization.yaml
+
+      - name: Build kubebuilder CLI
+        working-directory: .
+        run: make build
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Build project-v4-with-plugins
+        run: |
+          go mod tidy
+          make all
+
+      - name: Rebuild installer and regenerate Helm chart (v2-alpha)
+        run: |
+          make build-installer
+          ../../bin/kubebuilder edit --plugins=helm/v2-alpha --force
+
+      - name: Install kind
+        working-directory: .
+        run: |
+          make kind
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Create kind cluster
+        run: kind create cluster
+
+      - name: Prepare project-v4-with-plugins
+        run: |
+          go mod tidy
+          make docker-build
+          kind load docker-image "$IMG"
+
+      - name: Install Helm
+        run: |
+          make helm
+          # Use the Helm installed by make helm in the next steps
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Lint Helm Chart
+        run: helm lint ./dist/chart
+
+      - name: Install cert-manager via Helm (wait for readiness)
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+          helm install cert-manager jetstack/cert-manager \
+            --version ${CERT_MANAGER_VERSION} \
+            --namespace cert-manager \
+            --create-namespace \
+            --set crds.enabled=true \
+            --wait \
+            --timeout 300s
+
+      - name: Install Prometheus Operator CRDs
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm install prometheus-crds prometheus-community/prometheus-operator-crds \
+            --version ${PROMETHEUS_OPERATOR_CRDS_VERSION}
+
+      - name: Deploy manager via Helm
+        run: |
+          make helm-deploy HELM_EXTRA_ARGS="--set prometheus.enabled=true"
+
+      - name: Check Helm release status
+        run: |
+          make helm-status
+
+      - name: Delete kind cluster
+        if: always()
+        run: |
+          kind delete cluster || true
+
+  # Test scenario: 
+  # - scaffold project without creating webhooks, 
+  # - deploy helm chart without installing cert manager;
+  # - check that deployment has been deployed;
+  #
+  # Command to use to scaffold project without creating webhooks and so no need to install cert manager:
+  # - kubebuilder init
+  # - kubebuilder create api --group example.com --version v1 --kind App --controller=true --resource=true
+  # - kubebuilder edit --plugins=helm.kubebuilder.io/v2-alpha
+  test-helm-no-webhooks:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    # Runs the same steps as the scaffolded test-chart.yml
+    defaults:
+      run:
+        working-directory: test-helm-no-webhooks
+    env:
+      IMG: controller:latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kubebuilder binary
+        working-directory: .
+        run: make install
+
+      - name: Create test directory
+        working-directory: .
+        run: mkdir -p test-helm-no-webhooks
+
+      - name: Scaffold project with kubebuilder commands
+        run: |
+          go mod init test-helm-no-webhooks
+          kubebuilder init
+          kubebuilder create api --group example.com --version v1 --kind App --controller=true --resource=true
+          kubebuilder edit --plugins=helm.kubebuilder.io/v2-alpha
+
+      - name: Install kind
+        working-directory: .
+        run: |
+          make kind
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Create kind cluster
+        run: kind create cluster
+
+      - name: Prepare test-helm-no-webhooks
+        run: |
+          go mod tidy
+          make docker-build
+          kind load docker-image "$IMG"
+
+      - name: Install Helm
+        run: |
+          make helm
+          # Use the Helm installed by make helm in the next steps
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Lint Helm Chart
+        run: helm lint ./dist/chart
+
+      - name: Deploy manager via Helm
+        run: |
+          make helm-deploy
+
+      - name: Check Helm release status
+        run: |
+          make helm-status
+
+      - name: Delete kind cluster
+        if: always()
+        run: |
+          kind delete cluster || true

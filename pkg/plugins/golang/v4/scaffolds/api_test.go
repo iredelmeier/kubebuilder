@@ -1,0 +1,946 @@
+//go:build !integration
+
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package scaffolds
+
+import (
+	"bytes"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/spf13/afero"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/golang/v4/scaffolds/internal/templates/api"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/golang/v4/scaffolds/internal/templates/cmd"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/golang/v4/scaffolds/internal/templates/hack"
+)
+
+func ssaTestResourceGV(kind, group, version string, ssa bool) resource.Resource {
+	return resource.Resource{
+		GVK: resource.GVK{
+			Group:   group,
+			Domain:  "test.io",
+			Version: version,
+			Kind:    kind,
+		},
+		Plural: resource.RegularPlural(kind),
+		API:    &resource.API{CRDVersion: "v1", Namespaced: true, SSA: ssa},
+	}
+}
+
+func ssaTestResource(kind string, ssa bool) resource.Resource {
+	return ssaTestResourceGV(kind, "crew", "v1", ssa)
+}
+
+// testAPIPath is the Go package of the v1 API in the test project.
+const testAPIPath = "sigs.k8s.io/kubebuilder/test/api/v1"
+
+func newSSATestConfig(resources ...resource.Resource) config.Config {
+	cfg := cfgv3.New()
+	Expect(cfg.SetRepository("sigs.k8s.io/kubebuilder/test")).To(Succeed())
+	for _, res := range resources {
+		Expect(cfg.AddResource(res)).To(Succeed())
+	}
+	return cfg
+}
+
+var _ = Describe("controller scaffolding for library consumers", func() {
+	const backupController = "captain-backup"
+	DescribeTable("should scaffold and register the last explicitly named controller",
+		func(legacy bool, names []string, expectedName, expectedReconciler string) {
+			res := ssaTestResource("Captain", false)
+			res.API = nil
+			res.Path = testAPIPath
+			res.Controller = legacy //nolint:staticcheck // legacy library consumer
+			for _, name := range names {
+				if res.Controllers == nil {
+					res.Controllers = &resource.Controllers{}
+				}
+				Expect(res.Controllers.AddController(name)).To(Succeed())
+			}
+			cfg := newSSATestConfig()
+			fs := machinery.Filesystem{FS: afero.NewMemMapFs()}
+			Expect(machinery.NewScaffold(fs, machinery.WithConfig(cfg)).Execute(&cmd.Main{})).To(Succeed())
+			scaffolder := NewAPIScaffolder(cfg, res, false)
+			scaffolder.InjectFS(fs)
+			Expect(scaffolder.Scaffold()).To(Succeed())
+
+			content, err := afero.ReadFile(fs.FS,
+				filepath.Join("internal", "controller", expectedName+"_controller.go"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring("type " + expectedReconciler + " struct"))
+			mainContent, err := afero.ReadFile(fs.FS, "cmd/main.go")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(mainContent)).To(ContainSubstring("controller." + expectedReconciler + "{"))
+		},
+		Entry("legacy controller", true, nil, "captain", "CaptainReconciler"),
+		Entry("named controller", false, []string{backupController}, "captain_backup", "CaptainBackupReconciler"),
+		Entry("appended controller", false, []string{"captain", backupController},
+			"captain_backup", "CaptainBackupReconciler"),
+		Entry("named controller alongside legacy flag", true, []string{backupController},
+			"captain_backup", "CaptainBackupReconciler"),
+		Entry("controller name with several hyphens", false, []string{"captain-nightly-backup"},
+			"captain_nightly_backup", "CaptainNightlyBackupReconciler"),
+	)
+
+	// The CLI records the default controller by name, while older releases recorded `controller: true`.
+	// Both must scaffold the same files, so projects keep their file names, structs and Named() values.
+	DescribeTable("should scaffold the default controller as older releases did",
+		func(multiGroup bool, controllerFile, runtimeName string) {
+			scaffoldFiles := func(res resource.Resource) map[string]string {
+				cfg := newSSATestConfig()
+				if multiGroup {
+					Expect(cfg.SetMultiGroup()).To(Succeed())
+				}
+				fs := machinery.Filesystem{FS: afero.NewMemMapFs()}
+				Expect(machinery.NewScaffold(fs, machinery.WithConfig(cfg)).Execute(&cmd.Main{})).To(Succeed())
+				scaffolder := NewAPIScaffolder(cfg, res, false)
+				scaffolder.InjectFS(fs)
+				Expect(scaffolder.Scaffold()).To(Succeed())
+
+				files := map[string]string{}
+				Expect(afero.Walk(fs.FS, ".", func(path string, info os.FileInfo, err error) error {
+					if err != nil || info.IsDir() {
+						return err
+					}
+					content, readErr := afero.ReadFile(fs.FS, path)
+					Expect(readErr).NotTo(HaveOccurred())
+					files[path] = string(content)
+					return nil
+				})).To(Succeed())
+				return files
+			}
+
+			res := ssaTestResource("FirstMate", false)
+			res.API = nil
+			res.Path = testAPIPath
+			legacy := res.Copy()
+			legacy.Controller = true //nolint:staticcheck // what older releases passed to the scaffolder
+			named := res.Copy()
+			named.Controllers = &resource.Controllers{{Name: "firstmate"}}
+
+			legacyFiles := scaffoldFiles(legacy)
+			namedFiles := scaffoldFiles(named)
+			Expect(namedFiles).To(Equal(legacyFiles))
+
+			Expect(namedFiles).To(HaveKey(controllerFile))
+			Expect(namedFiles[controllerFile]).To(ContainSubstring("type FirstMateReconciler struct"))
+			Expect(namedFiles[controllerFile]).To(ContainSubstring(`Named("` + runtimeName + `")`))
+			Expect(namedFiles["cmd/main.go"]).To(ContainSubstring("controller.FirstMateReconciler{"))
+			for path, content := range namedFiles {
+				Expect(strings.ToLower(content)).NotTo(ContainSubstring("legacy"), path)
+				Expect(strings.ToLower(content)).NotTo(ContainSubstring("deprecated"), path)
+				Expect(strings.ToLower(content)).NotTo(ContainSubstring("migrat"), path)
+			}
+		},
+		Entry("in a single-group project", false,
+			filepath.Join("internal", "controller", "firstmate_controller.go"), "firstmate"),
+		Entry("in a multigroup project", true,
+			filepath.Join("internal", "controller", "crew", "firstmate_controller.go"), "crew-firstmate"),
+	)
+})
+
+var _ = Describe("scaffolding a legacy controller", func() {
+	// scaffoldFiles scaffolds res and returns every file written, by path.
+	scaffoldFiles := func(res resource.Resource, multiGroup bool) map[string]string {
+		GinkgoHelper()
+
+		cfg := newSSATestConfig()
+		if multiGroup {
+			Expect(cfg.SetMultiGroup()).To(Succeed())
+		}
+		fs := machinery.Filesystem{FS: afero.NewMemMapFs()}
+		Expect(machinery.NewScaffold(fs, machinery.WithConfig(cfg)).Execute(&cmd.Main{})).To(Succeed())
+		scaffolder := NewAPIScaffolder(cfg, res, false)
+		scaffolder.InjectFS(fs)
+		Expect(scaffolder.Scaffold()).To(Succeed())
+
+		files := map[string]string{}
+		Expect(afero.Walk(fs.FS, ".", func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() {
+				return err
+			}
+			content, readErr := afero.ReadFile(fs.FS, path)
+			Expect(readErr).NotTo(HaveOccurred())
+			files[path] = string(content)
+
+			return nil
+		})).To(Succeed())
+
+		return files
+	}
+
+	DescribeTable("should write the same files as a controller named after the kind",
+		func(kind string, multiGroup bool, controllerPath, reconciler string) {
+			apiPath := testAPIPath
+			if multiGroup {
+				apiPath = "sigs.k8s.io/kubebuilder/test/api/crew/v1"
+			}
+			legacy := ssaTestResource(kind, false)
+			legacy.Path = apiPath
+			legacy.Controller = true //nolint:staticcheck // legacy library consumer
+			named := ssaTestResource(kind, false)
+			named.Path = apiPath
+			named.Controllers = &resource.Controllers{{Name: resource.DefaultControllerName(kind)}}
+
+			legacyFiles := scaffoldFiles(legacy, multiGroup)
+			Expect(scaffoldFiles(named, multiGroup)).To(Equal(legacyFiles))
+
+			Expect(legacyFiles).To(HaveKeyWithValue(controllerPath, ContainSubstring("type "+reconciler+" struct")))
+			Expect(legacyFiles).To(HaveKey(strings.TrimSuffix(controllerPath, ".go") + "_test.go"))
+			Expect(legacyFiles).To(HaveKeyWithValue("cmd/main.go", ContainSubstring(reconciler+"{")))
+		},
+		Entry("for a simple kind", "Captain", false,
+			"internal/controller/captain_controller.go", "CaptainReconciler"),
+		Entry("for a compound kind", "FirstMate", false,
+			"internal/controller/firstmate_controller.go", "FirstMateReconciler"),
+		Entry("for an acronym kind", "HTTPRoute", false,
+			"internal/controller/httproute_controller.go", "HTTPRouteReconciler"),
+		Entry("for a simple kind in a multigroup project", "Captain", true,
+			"internal/controller/crew/captain_controller.go", "CaptainReconciler"),
+		Entry("for a compound kind in a multigroup project", "FirstMate", true,
+			"internal/controller/crew/firstmate_controller.go", "FirstMateReconciler"),
+		Entry("for an acronym kind in a multigroup project", "HTTPRoute", true,
+			"internal/controller/crew/httproute_controller.go", "HTTPRouteReconciler"),
+	)
+})
+
+var _ = Describe("API scaffolding with Server-Side Apply", func() {
+	Describe("hasSSAInPackage", func() {
+		It("should return true when another kind in the same group/version has SSA enabled", func() {
+			navigator := ssaTestResource("Navigator", true)
+			captain := ssaTestResource("Captain", false)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(navigator, captain),
+				resource: captain,
+			}
+
+			Expect(s.hasSSAInPackage()).To(BeTrue())
+		})
+
+		It("should return false when no other kind has SSA enabled", func() {
+			sailor := ssaTestResource("Sailor", false)
+			captain := ssaTestResource("Captain", false)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(sailor, captain),
+				resource: captain,
+			}
+
+			Expect(s.hasSSAInPackage()).To(BeFalse())
+		})
+
+		It("should return false when the SSA kind is in another version", func() {
+			navigatorV2 := ssaTestResourceGV("Navigator", "crew", "v2", true)
+			captain := ssaTestResource("Captain", false)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(navigatorV2, captain),
+				resource: captain,
+			}
+
+			Expect(s.hasSSAInPackage()).To(BeFalse())
+		})
+
+		It("should return false when the SSA kind is in another group", func() {
+			prawn := ssaTestResourceGV("Prawn", "sea-creatures", "v1", true)
+			captain := ssaTestResource("Captain", false)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(prawn, captain),
+				resource: captain,
+			}
+
+			Expect(s.hasSSAInPackage()).To(BeFalse())
+		})
+
+		It("should not count the resource being scaffolded itself", func() {
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(navigator),
+				resource: navigator,
+			}
+
+			Expect(s.hasSSAInPackage()).To(BeFalse())
+		})
+	})
+
+	Describe("isFirstSSAAPI", func() {
+		It("should return true when the project has no other API with SSA enabled", func() {
+			captain := ssaTestResource("Captain", false)
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(captain, navigator),
+				resource: navigator,
+			}
+
+			Expect(s.isFirstSSAAPI()).To(BeTrue())
+		})
+
+		It("should return false when the project already has an API with SSA enabled", func() {
+			navigator := ssaTestResource("Navigator", true)
+			prawn := ssaTestResource("Prawn", true)
+			s := &apiScaffolder{
+				config:   newSSATestConfig(navigator, prawn),
+				resource: prawn,
+			}
+
+			Expect(s.isFirstSSAAPI()).To(BeFalse())
+		})
+	})
+
+	Describe("Types template", func() {
+		scaffoldTypes := func(res resource.Resource, skipApplyConfig bool) string {
+			fs := machinery.Filesystem{FS: afero.NewMemMapFs()}
+			scaffold := machinery.NewScaffold(fs,
+				machinery.WithConfig(newSSATestConfig()),
+				machinery.WithBoilerplate("/* boilerplate */"),
+				machinery.WithResource(&res),
+			)
+			Expect(scaffold.Execute(&api.Types{SkipApplyConfig: skipApplyConfig})).To(Succeed())
+
+			typesPath := filepath.Join("api", res.Version, strings.ToLower(res.Kind)+"_types.go")
+			content, err := afero.ReadFile(fs.FS, typesPath)
+			Expect(err).NotTo(HaveOccurred())
+			return string(content)
+		}
+
+		It("should scaffold the genclient and apply configuration markers when SSA is enabled", func() {
+			content := scaffoldTypes(ssaTestResource("Navigator", true), false)
+
+			Expect(content).To(ContainSubstring("// +genclient"))
+			Expect(content).To(ContainSubstring("// +kubebuilder:ac:generate=true"))
+			Expect(content).NotTo(ContainSubstring("+kubebuilder:ac:generate=false"))
+			Expect(content).NotTo(ContainSubstring("+kubebuilder:resource:path="))
+		})
+
+		It("should scaffold the nonNamespaced marker when SSA is enabled for a cluster-scoped kind", func() {
+			res := ssaTestResource("Admiral", true)
+			res.API.Namespaced = false
+			content := scaffoldTypes(res, false)
+
+			Expect(content).To(ContainSubstring("// +genclient\n// +genclient:nonNamespaced"))
+			Expect(content).To(ContainSubstring("// +kubebuilder:resource:scope=Cluster"))
+			Expect(content).NotTo(ContainSubstring("+kubebuilder:resource:path="))
+		})
+
+		It("should keep the custom plural in the resource path when SSA is enabled", func() {
+			res := ssaTestResource("Admiral", true)
+			res.Plural = "admirales"
+			content := scaffoldTypes(res, false)
+
+			Expect(content).To(ContainSubstring("// +kubebuilder:resource:path=admirales"))
+		})
+
+		It("should keep the custom plural and scope in the resource path for a cluster-scoped kind with SSA enabled", func() {
+			res := ssaTestResource("Admiral", true)
+			res.Plural = "admirales"
+			res.API.Namespaced = false
+			content := scaffoldTypes(res, false)
+
+			Expect(content).To(ContainSubstring("// +kubebuilder:resource:path=admirales,scope=Cluster"))
+		})
+
+		It("should scaffold the opt-out marker when another kind in the package has SSA enabled", func() {
+			content := scaffoldTypes(ssaTestResource("Captain", false), true)
+
+			Expect(content).To(ContainSubstring("// +kubebuilder:ac:generate=false"))
+			Expect(content).NotTo(ContainSubstring("+genclient"))
+		})
+
+		It("should scaffold no SSA markers by default", func() {
+			content := scaffoldTypes(ssaTestResource("Captain", false), false)
+
+			Expect(content).NotTo(ContainSubstring("+genclient"))
+			Expect(content).NotTo(ContainSubstring("+kubebuilder:ac:generate"))
+		})
+
+		It("should scaffold both the scope and opt-out markers for a cluster-scoped kind in a package with SSA", func() {
+			res := ssaTestResource("Admiral", false)
+			res.API.Namespaced = false
+			content := scaffoldTypes(res, true)
+
+			Expect(content).To(ContainSubstring("// +kubebuilder:resource:scope=Cluster"))
+			Expect(content).To(ContainSubstring("// +kubebuilder:ac:generate=false"))
+			Expect(content).NotTo(ContainSubstring("+genclient"))
+		})
+	})
+
+	Describe("optOutExistingKinds", func() {
+		const captainTypes = `package v1
+
+// +kubebuilder:object:root=true
+// +kubebuilder:subresource:status
+
+type Captain struct{}
+`
+
+		var captainPath string
+
+		BeforeEach(func() {
+			tmpDir, err := os.MkdirTemp("", "ssa-opt-out")
+			Expect(err).NotTo(HaveOccurred())
+			oldWd, err := os.Getwd()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.Chdir(tmpDir)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(os.Chdir(oldWd)).To(Succeed())
+				_ = os.RemoveAll(tmpDir)
+			})
+
+			captainPath = filepath.Join("api", "v1", "captain_types.go")
+			Expect(os.MkdirAll(filepath.Dir(captainPath), 0o755)).To(Succeed())
+			Expect(os.WriteFile(captainPath, []byte(captainTypes), 0o644)).To(Succeed())
+		})
+
+		optOut := func(captain, navigator resource.Resource) {
+			cfg := newSSATestConfig(captain, navigator)
+			s := &apiScaffolder{config: cfg, resource: navigator}
+			resources, err := cfg.GetResources()
+			Expect(err).NotTo(HaveOccurred())
+			s.optOutExistingKinds(resources)
+		}
+
+		It("should add the opt-out marker to kinds scaffolded without SSA", func() {
+			optOut(ssaTestResource("Captain", false), ssaTestResource("Navigator", true))
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring(
+				"// +kubebuilder:object:root=true\n// +kubebuilder:ac:generate=false"))
+		})
+
+		It("should keep a single opt-out marker when run more than once", func() {
+			captain := ssaTestResource("Captain", false)
+			navigator := ssaTestResource("Navigator", true)
+			optOut(captain, navigator)
+			optOut(captain, navigator)
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Count(string(content), "+kubebuilder:ac:generate=false")).To(Equal(1))
+		})
+
+		It("should not change kinds that have SSA enabled", func() {
+			optOut(ssaTestResource("Captain", true), ssaTestResource("Navigator", true))
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(captainTypes))
+		})
+
+		It("should not change kinds that opted in manually with ac:generate=true", func() {
+			optedIn := strings.Replace(captainTypes,
+				"// +kubebuilder:object:root=true",
+				"// +kubebuilder:ac:generate=true\n// +kubebuilder:object:root=true", 1)
+			Expect(os.WriteFile(captainPath, []byte(optedIn), 0o644)).To(Succeed())
+
+			optOut(ssaTestResource("Captain", false), ssaTestResource("Navigator", true))
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(optedIn))
+		})
+
+		It("should not change kinds in another group/version", func() {
+			optOut(ssaTestResourceGV("Captain", "crew", "v2", false), ssaTestResource("Navigator", true))
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(captainTypes))
+		})
+
+		It("should warn and continue when a tracked kind has no types file", func() {
+			sailor := ssaTestResource("Sailor", false)
+			captain := ssaTestResource("Captain", false)
+			navigator := ssaTestResource("Navigator", true)
+			cfg := newSSATestConfig(sailor, captain, navigator)
+			s := &apiScaffolder{config: cfg, resource: navigator}
+			resources, err := cfg.GetResources()
+			Expect(err).NotTo(HaveOccurred())
+
+			s.optOutExistingKinds(resources)
+
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring("+kubebuilder:ac:generate=false"))
+		})
+	})
+
+	Describe("updateGroupVersionInfo", func() {
+		const groupVersionInfo = `// Package v1 contains API Schema definitions for the crew v1 API group.
+// +kubebuilder:object:generate=true
+// +groupName=crew.test.io
+package v1
+`
+
+		BeforeEach(func() {
+			tmpDir, err := os.MkdirTemp("", "ssa-gv-info")
+			Expect(err).NotTo(HaveOccurred())
+			oldWd, err := os.Getwd()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.Chdir(tmpDir)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(os.Chdir(oldWd)).To(Succeed())
+				_ = os.RemoveAll(tmpDir)
+			})
+		})
+
+		writeGroupVersionInfo := func(path string) {
+			Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
+			Expect(os.WriteFile(path, []byte(groupVersionInfo), 0o644)).To(Succeed())
+		}
+
+		It("should add the ac:generate marker after the object:generate marker", func() {
+			gvPath := filepath.Join("api", "v1", "groupversion_info.go")
+			writeGroupVersionInfo(gvPath)
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateGroupVersionInfo()
+
+			content, err := os.ReadFile(gvPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring(
+				"// +kubebuilder:object:generate=true\n// +kubebuilder:ac:generate=true"))
+		})
+
+		It("should keep a single marker when run more than once", func() {
+			gvPath := filepath.Join("api", "v1", "groupversion_info.go")
+			writeGroupVersionInfo(gvPath)
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateGroupVersionInfo()
+			s.updateGroupVersionInfo()
+
+			content, err := os.ReadFile(gvPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Count(string(content), "+kubebuilder:ac:generate=true")).To(Equal(1))
+		})
+
+		It("should use the group directory in multi-group projects", func() {
+			gvPath := filepath.Join("api", "crew", "v1", "groupversion_info.go")
+			writeGroupVersionInfo(gvPath)
+			navigator := ssaTestResource("Navigator", true)
+			cfg := newSSATestConfig(navigator)
+			Expect(cfg.SetMultiGroup()).To(Succeed())
+			s := &apiScaffolder{config: cfg, resource: navigator}
+
+			s.updateGroupVersionInfo()
+
+			content, err := os.ReadFile(gvPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(ContainSubstring("+kubebuilder:ac:generate=true"))
+		})
+
+		It("should warn and continue when the insertion anchor is missing", func() {
+			customized := `// Package v1 was customized and no longer has the generate marker.
+// +groupName=crew.test.io
+package v1
+`
+			gvPath := filepath.Join("api", "v1", "groupversion_info.go")
+			Expect(os.MkdirAll(filepath.Dir(gvPath), 0o755)).To(Succeed())
+			Expect(os.WriteFile(gvPath, []byte(customized), 0o644)).To(Succeed())
+
+			var logOutput bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+			DeferCleanup(func() { slog.SetDefault(previous) })
+
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateGroupVersionInfo()
+
+			Expect(logOutput.String()).To(ContainSubstring("marker was not found"))
+			Expect(logOutput.String()).To(ContainSubstring("+kubebuilder:ac:generate=true"))
+			Expect(logOutput.String()).To(ContainSubstring("+kubebuilder:object:generate=true"))
+			// The warning must not echo the file contents.
+			Expect(logOutput.String()).NotTo(ContainSubstring("Package v1 was customized"))
+
+			content, err := os.ReadFile(gvPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(customized))
+		})
+
+		It("should warn and continue when groupversion_info.go does not exist", func() {
+			var logOutput bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+			DeferCleanup(func() { slog.SetDefault(previous) })
+
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateGroupVersionInfo()
+
+			Expect(logOutput.String()).To(ContainSubstring("unable to check"))
+			Expect(logOutput.String()).To(ContainSubstring("+kubebuilder:ac:generate=true"))
+		})
+	})
+
+	Describe("Scaffold of an API with SSA in a package with plain kinds", func() {
+		const optOut = "// +kubebuilder:ac:generate=false"
+
+		var (
+			cfg         config.Config
+			captainPath string
+		)
+
+		BeforeEach(func() {
+			tmpDir, err := os.MkdirTemp("", "ssa-first-opt-in")
+			Expect(err).NotTo(HaveOccurred())
+			oldWd, err := os.Getwd()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.Chdir(tmpDir)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(os.Chdir(oldWd)).To(Succeed())
+				_ = os.RemoveAll(tmpDir)
+			})
+
+			cfg = newSSATestConfig()
+			captainPath = filepath.Join("api", "v1", "captain_types.go")
+			fs := machinery.Filesystem{FS: afero.NewOsFs()}
+			scaffold := machinery.NewScaffold(fs, machinery.WithConfig(cfg))
+			Expect(scaffold.Execute(&cmd.Main{})).To(Succeed())
+		})
+
+		createAPI := func(kind string, ssa bool) {
+			s := NewAPIScaffolder(cfg, ssaTestResource(kind, ssa), false)
+			s.InjectFS(machinery.Filesystem{FS: afero.NewOsFs()})
+			Expect(s.Scaffold()).To(Succeed())
+		}
+
+		readCaptain := func() string {
+			content, err := os.ReadFile(captainPath)
+			Expect(err).NotTo(HaveOccurred())
+			return string(content)
+		}
+
+		It("should opt the existing plain kinds out when the package is first opted in", func() {
+			createAPI("Captain", false)
+			Expect(readCaptain()).NotTo(ContainSubstring("+kubebuilder:ac:generate"))
+
+			createAPI("Navigator", true)
+
+			Expect(readCaptain()).To(ContainSubstring(optOut))
+		})
+
+		It("should opt the existing plain kinds out when the user turned the package on by hand", func() {
+			createAPI("Captain", false)
+			groupVersionPath := filepath.Join("api", "v1", "groupversion_info.go")
+			content, err := os.ReadFile(groupVersionPath)
+			Expect(err).NotTo(HaveOccurred())
+			const objectMarker = "// +kubebuilder:object:generate=true"
+			Expect(string(content)).To(ContainSubstring(objectMarker))
+			enabled := strings.Replace(string(content), objectMarker,
+				objectMarker+"\n// +kubebuilder:ac:generate=true", 1)
+			Expect(os.WriteFile(groupVersionPath, []byte(enabled), 0o644)).To(Succeed())
+
+			createAPI("Navigator", true)
+
+			Expect(readCaptain()).To(ContainSubstring(optOut))
+		})
+
+		It("should not add back an opt-out marker the user removed when the package is already opted in", func() {
+			createAPI("Captain", false)
+			createAPI("Navigator", true)
+			optedIn := strings.Replace(readCaptain(), optOut+"\n", "", 1)
+			Expect(optedIn).NotTo(ContainSubstring(optOut))
+			Expect(os.WriteFile(captainPath, []byte(optedIn), 0o644)).To(Succeed())
+
+			createAPI("Sailor", true)
+
+			Expect(readCaptain()).To(Equal(optedIn))
+		})
+
+		It("should not add back an opt-out marker the user removed on a forced re-run of the opted-in API", func() {
+			createAPI("Captain", false)
+			createAPI("Navigator", true)
+			optedIn := strings.Replace(readCaptain(), optOut+"\n", "", 1)
+			Expect(optedIn).NotTo(ContainSubstring(optOut))
+			Expect(os.WriteFile(captainPath, []byte(optedIn), 0o644)).To(Succeed())
+
+			s := NewAPIScaffolder(cfg, ssaTestResource("Navigator", true), true)
+			s.InjectFS(machinery.Filesystem{FS: afero.NewOsFs()})
+			Expect(s.Scaffold()).To(Succeed())
+
+			Expect(readCaptain()).To(Equal(optedIn))
+		})
+
+		It("should opt a plain kind created later in the package out", func() {
+			createAPI("Navigator", true)
+
+			createAPI("Captain", false)
+
+			Expect(readCaptain()).To(ContainSubstring(optOut))
+		})
+	})
+
+	Describe("addApplyConfigGenToMakefile", func() {
+		//nolint:lll
+		const manifestsLine = `"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases`
+		//nolint:lll
+		const manifestsHelp = "manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects."
+
+		var makefilePath, generatorsWithSSA string
+
+		BeforeEach(func() {
+			generatorsWithSSA = makefileManifestsGeneratorsWithSSA(hack.DefaultBoilerplatePath)
+			tmpDir, err := os.MkdirTemp("", "ssa-makefile")
+			Expect(err).NotTo(HaveOccurred())
+			DeferCleanup(func() {
+				_ = os.RemoveAll(tmpDir)
+			})
+			makefilePath = filepath.Join(tmpDir, "Makefile")
+		})
+
+		It("should add applyconfiguration to the manifests target and its help text", func() {
+			content := manifestsHelp + "\n\t" + manifestsLine + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(ContainSubstring(generatorsWithSSA + ` paths="./..."`))
+			Expect(string(result)).To(ContainSubstring(makefileManifestsHelpWithSSA))
+		})
+
+		It("should add applyconfiguration without headerFile when the project has no boilerplate file", func() {
+			content := manifestsHelp + "\n\t" + manifestsLine + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, "")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(ContainSubstring(`crd webhook applyconfiguration paths="./..."`))
+			Expect(string(result)).NotTo(ContainSubstring("headerFile"))
+			Expect(string(result)).To(ContainSubstring(makefileManifestsHelpWithSSA))
+		})
+
+		It("should update a manifests target with an unquoted CONTROLLER_GEN", func() {
+			content := manifestsHelp + "\n\t$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths=\"./...\"\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(ContainSubstring(generatorsWithSSA))
+		})
+
+		It("should skip a Makefile that already runs applyconfiguration generation", func() {
+			content := manifestsHelp + "\n\t" + `"$(CONTROLLER_GEN)" ` + generatorsWithSSA + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeFalse())
+		})
+
+		It("should add applyconfiguration when only a comment or another target mentions it", func() {
+			content := "# See the applyconfiguration docs before enabling Server-Side Apply.\n" +
+				manifestsHelp + "\n\t" + manifestsLine + "\n" +
+				"applyconfigs: ## Notes on applyconfiguration\n\t@echo applyconfiguration\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(ContainSubstring(generatorsWithSSA + ` paths="./..."`))
+		})
+
+		DescribeTable("should add applyconfiguration when a manifests recipe line only mentions it",
+			func(recipeLine string) {
+				content := manifestsHelp + "\n\t" + recipeLine + "\n"
+				Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+				updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updated).To(BeTrue())
+
+				result, err := os.ReadFile(makefilePath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(result)).To(ContainSubstring(generatorsWithSSA + ` paths="./..."`))
+			},
+			Entry("in a comment after the controller-gen command", manifestsLine+" # TODO: add applyconfiguration"),
+			Entry("in an echo command", manifestsLine+"\n\t@echo \"generated applyconfiguration\""),
+			Entry("in an echo command that names controller-gen", manifestsLine+"\n\t@echo controller-gen applyconfiguration"),
+		)
+
+		DescribeTable("should skip a manifests recipe that already runs applyconfiguration",
+			func(recipe string) {
+				content := manifestsHelp + "\n\t" + recipe + "\n"
+				Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+				updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(updated).To(BeFalse())
+
+				result, err := os.ReadFile(makefilePath)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(string(result)).To(Equal(content))
+			},
+			Entry("on a line of its own", manifestsLine+"\n\t"+`"$(CONTROLLER_GEN)" applyconfiguration paths="./..."`),
+			Entry("on a continued line indented with tabs",
+				`"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook \`+"\n\t\t"+
+					`applyconfiguration paths="./..." output:crd:artifacts:config=config/crd/bases`),
+			Entry("on a continued line indented with spaces",
+				`"$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook \`+"\n    "+
+					`applyconfiguration paths="./..." output:crd:artifacts:config=config/crd/bases`),
+			Entry("after another command", `cd . && "$(CONTROLLER_GEN)" rbac:roleName=manager-role crd webhook `+
+				`applyconfiguration paths="./..." output:crd:artifacts:config=config/crd/bases`),
+			Entry("after an environment variable", `GOFLAGS=-mod=mod "$(CONTROLLER_GEN)" rbac:roleName=manager-role `+
+				`crd webhook applyconfiguration paths="./..." output:crd:artifacts:config=config/crd/bases`),
+		)
+
+		It("should not duplicate anything when run more than once", func() {
+			content := manifestsHelp + "\n\t" + manifestsLine + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			afterFirstRun, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+
+			updated, err = addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeFalse())
+
+			afterSecondRun, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(afterSecondRun)).To(Equal(string(afterFirstRun)))
+			Expect(strings.Count(string(afterSecondRun), "applyconfiguration:headerFile")).To(Equal(1))
+			Expect(strings.Count(string(afterSecondRun), "and ApplyConfiguration types")).To(Equal(1))
+		})
+
+		It("should update only the manifests target when another target runs the same generators", func() {
+			content := "manifests-fast: controller-gen\n\t" + manifestsLine + "\n" +
+				manifestsHelp + "\n\t" + manifestsLine + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			updated, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(updated).To(BeTrue())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.Count(string(result), "applyconfiguration:headerFile")).To(Equal(1))
+			Expect(string(result)).To(ContainSubstring("manifests-fast: controller-gen\n\t" + manifestsLine))
+		})
+
+		It("should return an error and change nothing when the help comment was customized", func() {
+			content := "manifests: controller-gen ## My custom help\n\t" + manifestsLine + "\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			_, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).To(HaveOccurred())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(Equal(content))
+		})
+
+		It("should return an error and change nothing when the manifests generators are not found", func() {
+			content := manifestsHelp + "\n\tcustom-generator paths=\"./...\"\n"
+			Expect(os.WriteFile(makefilePath, []byte(content), 0o644)).To(Succeed())
+
+			_, err := addApplyConfigGenToMakefile(makefilePath, hack.DefaultBoilerplatePath)
+			Expect(err).To(HaveOccurred())
+
+			result, err := os.ReadFile(makefilePath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(result)).To(Equal(content))
+		})
+
+		It("should return an error when the Makefile does not exist", func() {
+			_, err := addApplyConfigGenToMakefile(filepath.Join("does", "not", "exist", "Makefile"), hack.DefaultBoilerplatePath)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
+	Describe("updateMakefile", func() {
+		const customized = "manifests: controller-gen ## My custom help\n\tcustom-generator paths=\"./...\"\n"
+
+		var logOutput bytes.Buffer
+
+		BeforeEach(func() {
+			tmpDir, err := os.MkdirTemp("", "ssa-update-makefile")
+			Expect(err).NotTo(HaveOccurred())
+			oldWd, err := os.Getwd()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(os.Chdir(tmpDir)).To(Succeed())
+			DeferCleanup(func() {
+				Expect(os.Chdir(oldWd)).To(Succeed())
+				_ = os.RemoveAll(tmpDir)
+			})
+			Expect(os.WriteFile("Makefile", []byte(customized), 0o644)).To(Succeed())
+
+			logOutput.Reset()
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+			DeferCleanup(func() { slog.SetDefault(previous) })
+		})
+
+		It("should warn with the headerFile generator and continue when the Makefile was customized", func() {
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateMakefile(hack.DefaultBoilerplatePath)
+
+			Expect(logOutput.String()).To(ContainSubstring("unable to update the Makefile"))
+			Expect(logOutput.String()).To(ContainSubstring(`applyconfiguration:headerFile=\"hack/boilerplate.go.txt\"`))
+			content, err := os.ReadFile("Makefile")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(customized))
+		})
+
+		It("should warn with the generator without headerFile when the project has no boilerplate file", func() {
+			navigator := ssaTestResource("Navigator", true)
+			s := &apiScaffolder{config: newSSATestConfig(navigator), resource: navigator}
+
+			s.updateMakefile("")
+
+			Expect(logOutput.String()).To(ContainSubstring("unable to update the Makefile"))
+			Expect(logOutput.String()).To(ContainSubstring(`crd webhook applyconfiguration paths=`))
+			Expect(logOutput.String()).NotTo(ContainSubstring("headerFile"))
+			content, err := os.ReadFile("Makefile")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(customized))
+		})
+	})
+})

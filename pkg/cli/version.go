@@ -23,14 +23,17 @@ import (
 )
 
 func (c CLI) newVersionCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:     "version",
+	cmd := &cobra.Command{
+		Use:     kubebuilderSubcommandVersion,
 		Short:   fmt.Sprintf("Print the %s version", c.commandName),
 		Long:    fmt.Sprintf("Print the %s version", c.commandName),
-		Example: fmt.Sprintf("%s version", c.commandName),
-		RunE: func(_ *cobra.Command, _ []string) error {
-			fmt.Println(c.version)
+		Example: fmt.Sprintf("%s %s", c.commandName, kubebuilderSubcommandVersion),
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if _, err := fmt.Fprintln(cmd.OutOrStdout(), c.version); err != nil {
+				return fmt.Errorf("failed to print the version: %w", err)
+			}
 			return nil
 		},
 	}
+	return cmd
 }

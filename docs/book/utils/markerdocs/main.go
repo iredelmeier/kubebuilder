@@ -50,15 +50,15 @@ func maybeDetails(help *DetailedHelp) toHTML {
 			summary(optionalClasses{"no-details": help.Details == ""},
 				Text(help.Summary)),
 			// NB(directxman12): if we don't wrap with newlines, markdown won't be parsed
-			Text(wrapWithNewlines(help.Details)))}
+			Text(wrapWithNewlines(help.Details))),
+	}
 }
 
 // markerTemplate returns HTML describing the documentation for a given marker.
 func markerTemplate(marker *MarkerDoc) toHTML {
-
 	// the marker name
 	term := dt(classes{"literal", "name"},
-		Text(marker.Name))
+		Text("// +"+marker.Name))
 
 	// the args summary (displayed in summary mode)
 	var fields []toHTML
@@ -83,7 +83,8 @@ func markerTemplate(marker *MarkerDoc) toHTML {
 			dd(optionalClasses{"argument": true, "type": true, "optional": field.Optional},
 				argType(&field.Argument)),
 			dd(classes{"description"},
-				maybeDetails(&field.DetailedHelp))})
+				maybeDetails(&field.DetailedHelp)),
+		})
 	}
 
 	// the help (displayed in both modes)
@@ -164,7 +165,7 @@ func (p MarkerDocs) Process(input *plugin.Input) error {
 		content := new(strings.Builder)
 
 		// NB(directxman12): wrap this in a div to prevent the markdown processor from inserting extra paragraphs
-		_, err := fmt.Fprintf(content, "<div><input checked type=\"checkbox\" class=\"markers-summarize\" id=\"markers-summarize-%[1]s\"></input><label class=\"markers-summarize\" for=\"markers-summarize-%[1]s\">Show Detailed Argument Help</label><dl class=\"markers\">", categoryAlias)
+		_, err := fmt.Fprintf(content, "<div><input checked type=\"checkbox\" class=\"markers-summarize\" id=\"markers-summarize-%[1]s\"><label class=\"markers-summarize\" for=\"markers-summarize-%[1]s\">Show Detailed Argument Help</label><dl class=\"markers\">", categoryAlias)
 		if err != nil {
 			return "", fmt.Errorf("unable to render marker documentation summary: %v", err)
 		}
@@ -256,9 +257,9 @@ func main() {
 	if err := plugin.Run(MarkerDocs{
 		Args: map[string][]string{
 			// marker args
-			"": []string{"-wwww", "crd", "webhook", "rbac:roleName=cheddar" /* role name doesn't mean anything here */, "object", "schemapatch:manifests=."},
+			"": {"-wwww", "crd", "webhook", "rbac:roleName=cheddar" /* role name doesn't mean anything here */, "object", "schemapatch:manifests=.", "applyconfiguration"},
 			// cli options args
-			"CLI: ": []string{"-hhhh"},
+			"CLI: ": {"-hhhh"},
 		},
 	}, os.Stdin, os.Stdout, os.Args[1:]...); err != nil {
 		log.Fatal(err.Error())

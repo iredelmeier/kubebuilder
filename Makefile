@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-#  Copyright 2019 The Kubernetes Authors.
+#  Copyright 2023 The Kubernetes Authors.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -19,6 +19,20 @@
 #
 export GOPROXY?=https://proxy.golang.org/
 
+#
+# Go.
+#
+# GO_VERSION is the toolchain used for builds and vulnerability scans.
+# Keep the go directive in go.mod at GO_DIRECTIVE_VERSION so library consumers
+# are not forced onto a newer patch (same split as Cluster API).
+# See: https://github.com/kubernetes-sigs/cluster-api/blob/main/Makefile
+GO_VERSION ?= 1.26.11
+GO_DIRECTIVE_VERSION ?= 1.26.0
+
+# Ensure the correct toolchain is used (overrides a newer local Go for scans/builds).
+GOTOOLCHAIN = go$(GO_VERSION)
+export GOTOOLCHAIN
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -26,11 +40,16 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
+## Location to install dependencies to
+LOCALBIN ?= $(shell pwd)/bin
+$(LOCALBIN):
+	mkdir -p $(LOCALBIN)
+
 ##@ General
 
 # The help target prints out all targets with their descriptions organized
 # beneath their categories. The categories are represented by '##@' and the
-# target descriptions by '##'. The awk commands is responsible for reading the
+# target descriptions by '##'. The awk command is responsible for reading the
 # entire set of makefiles included in this invocation, looking for lines of the
 # file as xyz: ## something, and then pretty-format the target and help. Then,
 # if there's a line with ##@ something, that gets pretty-printed as a category.
@@ -45,67 +64,180 @@ help: ## Display this help
 
 ##@ Build
 
-LD_FLAGS=-ldflags " \
-    -X main.kubeBuilderVersion=$(shell git describe --tags --dirty --broken) \
-    -X main.goos=$(shell go env GOOS) \
-    -X main.goarch=$(shell go env GOARCH) \
-    -X main.gitCommit=$(shell git rev-parse HEAD) \
-    -X main.buildDate=$(shell date -u +'%Y-%m-%dT%H:%M:%SZ') \
-    "
 .PHONY: build
 build: ## Build the project locally
-	go build $(LD_FLAGS) -o bin/kubebuilder ./cmd
+	go build --trimpath -o bin/kubebuilder
 
 .PHONY: install
 install: build ## Build and install the binary with the current source code. Use it to test your changes locally.
+	rm -f $(GOBIN)/kubebuilder
 	cp ./bin/kubebuilder $(GOBIN)/kubebuilder
 
 ##@ Development
 
 .PHONY: generate
-generate: generate-testdata ## Update/generate all mock data. You should run this commands to update the mock data after your changes.
+generate: generate-testdata generate-docs ## Update/generate all mock data. You should run this commands to update the mock data after your changes.
 	go mod tidy
+	make remove-spaces
+
+.PHONY: remove-spaces
+remove-spaces:
+	@echo "Removing trailing spaces"
+	@bash -c ' \
+		if sed --version 2>&1 | grep -q "GNU"; then \
+			find . -type f -name "*.md" -exec sed -i "s/[[:space:]]*$$//" {} + || true; \
+		else \
+			find . -type f -name "*.md" -exec sed -i "" "s/[[:space:]]*$$//" {} + || true; \
+		fi'
 
 .PHONY: generate-testdata
 generate-testdata: ## Update/generate the testdata in $GOPATH/src/sigs.k8s.io/kubebuilder
+	chmod -R +w testdata/
+	rm -rf testdata/
 	./test/testdata/generate.sh
 
+.PHONY: generate-docs
+generate-docs: ## Update/generate the docs
+	./hack/docs/generate.sh
+	$(MAKE) fix-docs
+
+.PHONY: generate-charts
+generate-charts: build ## Re-generate the helm chart testdata and docs samples
+	rm -rf testdata/project-v4-with-plugins/dist/chart
+	rm -rf docs/book/src/getting-started/testdata/project/dist/chart
+	rm -rf docs/book/src/cronjob-tutorial/testdata/project/dist/chart
+	rm -rf docs/book/src/multiversion-tutorial/testdata/project/dist/chart
+
+	# Generate helm charts from kustomize manifests using v2-alpha plugin
+	(cd testdata/project-v4-with-plugins && make build-installer && ../../bin/kubebuilder edit --plugins=helm/v2-alpha)
+	(cd docs/book/src/getting-started/testdata/project && make build-installer && ../../../../../../bin/kubebuilder edit --plugins=helm/v2-alpha)
+	(cd docs/book/src/cronjob-tutorial/testdata/project && make build-installer && ../../../../../../bin/kubebuilder edit --plugins=helm/v2-alpha)
+	(cd docs/book/src/multiversion-tutorial/testdata/project && make build-installer && ../../../../../../bin/kubebuilder edit --plugins=helm/v2-alpha)
+
+.PHONY: fix-docs
+fix-docs: ## Fix documentation issues (accessibility + trailing spaces)
+	./hack/docs/fix_note_accessibility.sh
+	$(MAKE) remove-spaces
+
 .PHONY: lint
-lint: golangci-lint ## Run golangci-lint linter
+lint: golangci-lint lint-project-rules ## Run golangci-lint linter
 	$(GOLANGCI_LINT) run
+
+# The project's own lint rules live in hack/lint/ruleguard/rules.go, and
+# golangci-lint runs them through gocritic's ruleguard check. golangci-lint
+# checks only the default build, so this also runs them on the files tagged
+# //go:build integration. Add a new project rule to that file; it is checked
+# here with no other change.
+.PHONY: lint-project-rules
+lint-project-rules: golangci-lint ## Run the project's own lint rules on the files tagged integration too
+	$(GOLANGCI_LINT) run --build-tags=integration --enable-only gocritic
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
 	$(GOLANGCI_LINT) run --fix
 
-GOLANGCI_LINT = $(shell pwd)/bin/golangci-lint
+.PHONY: lint-fmt
+lint-fmt: golangci-lint ## Verify Go code is formatted
+	$(GOLANGCI_LINT) fmt --diff
+
+
+# Lint all YAML: testdata files (yamllint-yaml) + Helm-rendered charts (yamllint-helm).
+# Repo YAML uses .yamllint; Helm output uses .yamllint-helm.
+YAMLLINT_FILES := $(shell find testdata -name '*.yaml' ! -path 'testdata/.helm-rendered.yaml' \( ! -path 'testdata/*/dist/*' -o -path 'testdata/*/dist/chart/Chart.yaml' -o -path 'testdata/*/dist/chart/values.yaml' \) 2>/dev/null)
+HELM_CHARTS := $(shell find testdata docs/book -type d -path '*/dist/chart' 2>/dev/null)
+
+.PHONY: yamllint yamllint-yaml yamllint-helm
+yamllint: yamllint-yaml yamllint-helm
+
+yamllint-yaml:
+	@docker run --rm $$(tty -s && echo "-it" || echo) -v $(PWD):/data -w /data cytopia/yamllint:$(YAMLLINT_IMAGE_TAG) $(YAMLLINT_FILES) -c .yamllint --no-warnings
+
+yamllint-helm: helm
+	@for chart in $(HELM_CHARTS); do \
+	  $(HELM) template release $$chart --namespace=release-system 2>/dev/null | \
+	  docker run --rm -i -v $(PWD):/data -w /data cytopia/yamllint:$(YAMLLINT_IMAGE_TAG) -c .yamllint-helm --no-warnings - || (echo "yamllint-helm: $$chart failed"; exit 1); \
+	done
+
+# All Kubebuilder-generated samples (go/v4, kustomize, helm use machinery defaults 0755/0644).
+SAMPLE_ROOTS := testdata \
+	docs/book/src/getting-started/testdata \
+	docs/book/src/cronjob-tutorial/testdata \
+	docs/book/src/multiversion-tutorial/testdata
+
+.PHONY: golangci-lint
 golangci-lint:
-	@[ -f $(GOLANGCI_LINT) ] || { \
-	set -e ;\
-	curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b $(shell dirname $(GOLANGCI_LINT)) v1.37.1 ;\
-	}
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,${GOLANGCI_LINT_VERSION})
+
+.PHONY: apidiff
+apidiff: go-apidiff ## Run the go-apidiff to verify any API differences compared with origin/master
+	$(GO_APIDIFF) master --compare-imports --print-compatible --repo-path=.
+
+.PHONY: go-apidiff
+go-apidiff:
+	$(call go-install-tool,$(GO_APIDIFF),github.com/joelanford/go-apidiff,$(GO_APIDIFF_VERSION))
+
+GOVULNCHECK_VERSION ?= v1.3.0
+
+.PHONY: govulncheck
+govulncheck: ## Run govulncheck (https://go.dev/doc/security/vuln/) against the module.
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+
+.PHONY: go-version
+go-version: ## Print the Go toolchain version used for builds and scans
+	@echo $(GO_VERSION)
 
 ##@ Tests
 
 .PHONY: test
-test: test-unit test-integration test-testdata ## Run the unit and integration tests (used in the CI)
+test: test-unit test-integration test-testdata test-book verify-license test-gomod ## Run the unit and integration tests (used in the CI)
 
 .PHONY: test-unit
+TEST_PKGS := ./pkg/... $(shell go list ./internal/... | grep -v 'internal/update$$') ./test/e2e/utils/...
 test-unit: ## Run the unit tests
-	go test -race -v ./pkg/...
-
-.PHONY: test-coverage
-test-coverage: ## Run unit tests creating the output to report coverage
-	- rm -rf *.out  # Remove all coverage files if exists
-	go test -race -failfast -tags=integration -coverprofile=coverage-all.out -coverpkg="./pkg/cli/...,./pkg/config/...,./pkg/internal/...,./pkg/machinery/...,./pkg/model/...,./pkg/plugin/...,./pkg/plugins/golang" ./pkg/...
+	go test -race $(TEST_PKGS)
 
 .PHONY: test-integration
-test-integration: ## Run the integration tests
-	./test/integration.sh
+test-integration: install ## Run the integration tests (requires kubebuilder binary in PATH)
+	go test -race -tags=integration -timeout 30m $(TEST_PKGS)
 
-.PHONY: check-testdata
-check-testdata: ## Run the script to ensure that the testdata is updated
-	./test/testdata/check.sh
+# Running every spec in random order ensures each spec sets up what it uses
+# and puts back what it changes. It catches a spec that passes only because
+# another one ran before it, and a spec that leaves something changed, such as
+# an empty HOME, that breaks the specs after it. Neither shows while the order
+# stays the same. TEST_PKGS leaves out the alpha update suite, as in the other
+# test targets, because it is heavy: it downloads old Kubebuilder release
+# binaries on every run. It installs Helm first, because the Helm plugin's
+# integration specs render the chart with `helm template` and skip themselves
+# when `helm` is not on PATH; the installed Helm is used when there is none.
+# A failure prints the seed; rerun it with
+# make test-random GINKGO_RANDOM_FLAGS="-ginkgo.randomize-all -ginkgo.seed=<seed>".
+GINKGO_RANDOM_FLAGS ?= -ginkgo.randomize-all
+.PHONY: test-random
+test-random: install helm ## Run the unit and integration tests with every Ginkgo spec in random order
+	PATH="$$PATH:$(LOCALBIN)" go test -race $(TEST_PKGS) $(GINKGO_RANDOM_FLAGS)
+	PATH="$$PATH:$(LOCALBIN)" go test -race -tags=integration -timeout 30m $(TEST_PKGS) $(GINKGO_RANDOM_FLAGS)
+
+.PHONY: test-coverage
+test-coverage: ## Run unit and integration tests with coverage report
+	- rm -rf *.out  # Remove all coverage files if exists
+	go test -race -failfast -tags=integration -timeout 30m \
+		-coverprofile=coverage-all.out \
+		-coverpkg="\
+./pkg/cli/...,\
+./pkg/config/...,\
+./pkg/internal/...,\
+./pkg/machinery/...,\
+./pkg/model/...,\
+./pkg/plugin/...,\
+./pkg/plugins/golang,\
+./pkg/plugins/golang/deploy-image/v1alpha1,\
+./pkg/plugins/golang/v4,\
+./pkg/plugins/external/...,\
+./pkg/plugins/common/kustomize/v2,\
+./pkg/plugins/optional/autoupdate/v1alpha,\
+./pkg/plugins/optional/grafana/...,\
+./pkg/plugins/optional/helm/v2alpha/..." \
+		$(TEST_PKGS)
 
 .PHONY: test-testdata
 test-testdata: ## Run the tests of the testdata directory
@@ -119,3 +251,129 @@ test-e2e-local: ## Run the end-to-end tests locally
 .PHONY: test-e2e-ci
 test-e2e-ci: ## Run the end-to-end tests (used in the CI)`
 	./test/e2e/ci.sh
+
+.PHONY: test-book
+test-book: ## Run the cronjob tutorial's unit tests to make sure we don't break it
+	cd ./docs/book/src/cronjob-tutorial/testdata/project && make test
+	cd ./docs/book/src/multiversion-tutorial/testdata/project && make test
+	cd ./docs/book/src/getting-started/testdata/project && make test
+	./hack/docs/test_webhook_certs.sh
+
+.PHONY: test-gomod
+test-gomod:  ## Run the Go module compatibility check
+	go run ./hack/test/check_go_module.go
+
+.PHONY: test-docker-build-context
+test-docker-build-context: ## Check the scaffolded .dockerignore ships only the manager sources to the image build
+	./test/verify-docker-build-context.sh testdata/project-v4
+
+.PHONY: test-external-plugin
+test-external-plugin: install  ## Run tests for external plugin
+	make -C docs/book/src/simple-external-plugin-tutorial/testdata/sampleexternalplugin/v1 install
+	make -C docs/book/src/simple-external-plugin-tutorial/testdata/sampleexternalplugin/v1 test-plugin
+
+.PHONY: install-kube-linter
+install-kube-linter: ## Install kube-linter locally if necessary
+	@mkdir -p $(LOCALBIN)
+	$(call go-install-tool,$(KUBE_LINTER),golang.stackrox.io/kube-linter/cmd/kube-linter,$(KUBE_LINTER_VERSION))
+
+.PHONY: helm-lint
+helm-lint: helm ## Lint all Helm charts in testdata and docs
+	@for chart in $(HELM_CHARTS); do \
+		echo "Linting $$chart..."; \
+		$(HELM) lint $$chart || exit 1; \
+	done
+
+.PHONY: kube-linter
+kube-linter: helm install-kube-linter ## Lint all Helm charts with kube-linter
+	@for chart in $(HELM_CHARTS); do \
+		echo "Validating $$chart with kube-linter..."; \
+		$(HELM) template $$chart | $(KUBE_LINTER) lint - || exit 1; \
+	done
+
+##@ Verification
+
+.PHONY: verify
+verify: verify-lint verify-license verify-sample-permissions verify-testdata verify-docs verify-helm ## Run all verification checks
+
+.PHONY: verify-lint
+verify-lint: verify-lint-config lint-fmt yamllint-yaml lint-project-rules ## Run linting checks (config, format, YAML, project rules on integration files). Note: the full golangci-lint run is done via CI action for PR comments
+
+.PHONY: verify-lint-config
+verify-lint-config: golangci-lint ## Verify golangci-lint linter configuration
+	$(GOLANGCI_LINT) config verify
+
+.PHONY: verify-license
+verify-license: ## Verify license headers
+	./test/check-license.sh
+
+.PHONY: verify-sample-permissions
+verify-sample-permissions: ## Verify sample file permissions (0644 for files, 0755 for dirs)
+	@for d in $(SAMPLE_ROOTS); do \
+		test -d "$$d" || continue; \
+		bad=$$(find "$$d" -path '*/bin' -prune -o \( \( -type f ! -perm 0644 \) -o \( -type d ! -perm 0755 \) \) -print 2>/dev/null); \
+		if [ -n "$$bad" ]; then echo "Invalid permissions under $$d (expect 0644/0755):"; echo "$$bad"; exit 1; fi; \
+	done
+
+.PHONY: verify-testdata
+verify-testdata: ## Verify testdata is up to date
+	./test/testdata/check.sh
+
+.PHONY: verify-docs
+verify-docs: ## Verify documentation (generation, accessibility, trailing spaces)
+	./hack/docs/check.sh
+	./test/check_docs_accessibility.sh
+	./test/check_spaces.sh
+
+.PHONY: verify-helm
+verify-helm: yamllint-helm helm-lint kube-linter ## Verify Helm charts (yamllint + helm lint + kube-linter)
+
+## Tool Binaries
+GO_APIDIFF ?= $(LOCALBIN)/go-apidiff
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+HELM ?= $(LOCALBIN)/helm
+KIND ?= $(LOCALBIN)/kind
+KUBE_LINTER ?= $(LOCALBIN)/kube-linter
+
+## Tool Versions
+GO_APIDIFF_VERSION ?= v0.8.3
+GOLANGCI_LINT_VERSION ?= v2.15.0
+HELM_VERSION ?= v4.3.1
+KIND_VERSION ?= v0.33.0
+YAMLLINT_IMAGE_TAG ?= 1-0.14
+KUBE_LINTER_VERSION ?= v0.8.3
+
+.PHONY: kind
+kind: $(LOCALBIN) ## Download kind locally if necessary
+ifeq ($(KIND),$(LOCALBIN)/kind)
+	$(call go-install-tool,$(KIND),sigs.k8s.io/kind,$(KIND_VERSION))
+endif
+
+.PHONY: helm
+helm: $(LOCALBIN) ## Download Helm locally if necessary
+ifeq ($(HELM),$(LOCALBIN)/helm)
+helm: $(LOCALBIN)/helm-$(HELM_VERSION)
+	@ln -sf "helm-$(HELM_VERSION)" "$(HELM)"
+endif
+
+# The Helm install script checks that helm is on PATH
+$(LOCALBIN)/helm-$(HELM_VERSION): | $(LOCALBIN)
+	curl -fsSL -o "$(LOCALBIN)/get-helm-4" https://raw.githubusercontent.com/helm/helm/$(HELM_VERSION)/scripts/get-helm-4
+	PATH="$(LOCALBIN):$$PATH" HELM_INSTALL_DIR="$(LOCALBIN)" BINARY_NAME=helm-$(HELM_VERSION) USE_SUDO=false \
+		bash "$(LOCALBIN)/get-helm-4" --version $(HELM_VERSION)
+
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary
+# $2 - package url which can be installed
+# $3 - specific version of package
+define go-install-tool
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f $(1) ;\
+GOBIN=$(LOCALBIN) go install $${package} ;\
+mv $(1) $(1)-$(3) ;\
+} ;\
+ln -sf $$(realpath $(1)-$(3)) $(1)
+endef

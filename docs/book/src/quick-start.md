@@ -1,4 +1,4 @@
-# Quick Start
+# Quick start
 
 This Quick Start guide will cover:
 
@@ -9,19 +9,15 @@ This Quick Start guide will cover:
 
 ## Prerequisites
 
-- [go](https://golang.org/dl/) version v1.15+ and < 1.16.
+- [go](https://go.dev/dl/) version v1.24.6+
 - [docker](https://docs.docker.com/install/) version 17.03+.
 - [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) version v1.11.3+.
 - Access to a Kubernetes v1.11.3+ cluster.
 
-<aside class="note">
-<h1>Versions and Supportability</h1>
+<aside class="note" role="note">
+<p class="note-title">Versions Compatibility and Supportability</p>
 
-Projects created by Kubebuilder contain a Makefile that will install tools at versions defined at creation time. Those tools are:
-- [kustomize](https://kubernetes-sigs.github.io/kustomize/)
-- [controller-gen](https://github.com/kubernetes-sigs/controller-tools)
-
-The versions which are defined in the `Makefile` and `go.mod` files are the versions tested and therefore is recommend to use the specified versions.
+Please ensure that you see the [guidance](./versions_compatibility_supportability.md).
 
 </aside>
 
@@ -31,27 +27,28 @@ Install [kubebuilder](https://sigs.k8s.io/kubebuilder):
 
 ```bash
 # download kubebuilder and install locally.
-curl -L -o kubebuilder https://go.kubebuilder.io/dl/latest/$(go env GOOS)/$(go env GOARCH)
-chmod +x kubebuilder && mv kubebuilder /usr/local/bin/
+curl -L -o kubebuilder "https://go.kubebuilder.io/dl/latest/$(go env GOOS)/$(go env GOARCH)"
+chmod +x kubebuilder && sudo mv kubebuilder /usr/local/bin/
 ```
 
-<aside class="note">
-<h1>Using master branch</h1>
+<aside class="note" role="note">
+<p class="note-title">Using the Master Branch</p>
 
-You can work with a master snapshot by installing from `https://go.kubebuilder.io/dl/master/$(go env GOOS)/$(go env GOARCH)`.
-
-</aside>
-
-<aside class="note">
-<h1>Enabling shell autocompletion</h1>
-
-Kubebuilder provides autocompletion support for Bash and Zsh via the command `kubebuilder completion <bash|zsh>`, which can save you a lot of typing. For further information see the [completion](./reference/completion.md) document.
+You can work with the master branch by cloning the repository and running `make install` to generate the binary.
+Please follow the steps in the section **How to Build Kubebuilder Locally** from the [Contributing Guide](https://github.com/kubernetes-sigs/kubebuilder/blob/master/CONTRIBUTING.md#how-to-build-kubebuilder-locally).
 
 </aside>
 
-## Create a Project
+<aside class="note" role="note">
+<p class="note-title">Enabling shell autocompletion</p>
 
-Create a directory, and then run the init command inside of it to initialize a new project. Follows an example.
+Kubebuilder provides autocompletion support via the command `kubebuilder completion <bash|fish|powershell|zsh>`, which can save you a lot of typing. For further information see the [completion](./reference/completion.md) document.
+
+</aside>
+
+## Create a project
+
+Create a directory, and then run the init command inside of it to initialize a new project. Below is an example:
 
 ```bash
 mkdir -p ~/projects/guestbook
@@ -59,16 +56,15 @@ cd ~/projects/guestbook
 kubebuilder init --domain my.domain --repo my.domain/guestbook
 ```
 
-<aside class="note">
-<h1>Developing in $GOPATH</h1>
+<aside class="note" role="note">
+<p class="note-title">Developing in $GOPATH</p>
 
-If your project is initialized within [`GOPATH`][GOPATH-golang-docs], the implicitly called `go mod init` will interpolate the module path for you.
+If you initialize your project within [`GOPATH`][GOPATH-golang-docs], the implicitly called `go mod init` will interpolate the module path for you.
 Otherwise `--repo=<module path>` must be set.
 
 Read the [Go modules blogpost][go-modules-blogpost] if unfamiliar with the module system.
 
 </aside>
-
 
 ## Create an API
 
@@ -78,20 +74,25 @@ Run the following command to create a new API (group/version) as `webapp/v1` and
 kubebuilder create api --group webapp --version v1 --kind Guestbook
 ```
 
-<aside class="note">
-<h1>Press Options</h1>
+<aside class="note" role="note">
+<p class="note-title">Press Options</p>
 
-If you press `y` for Create Resource [y/n] and for Create Controller [y/n] then this will create the files `api/v1/guestbook_types.go` where the API is defined
-and the `controllers/guestbook_controller.go` where the reconciliation business logic is implemented for this Kind(CRD).
+If you press `y` for Create Resource [y/n] and for Create Controller [y/n] then this creates the files `api/v1/guestbook_types.go` where you define the API
+and the `internal/controller/guestbook_controller.go` where you implement the reconciliation business logic for this Kind(CRD).
 
 </aside>
-
 
 **OPTIONAL:** Edit the API definition and the reconciliation business
 logic. For more info see [Designing an API](/cronjob-tutorial/api-design.md) and [What's in
 a Controller](cronjob-tutorial/controller-overview.md).
 
-<details><summary>Click here to see an example. `(api/v1/guestbook_types.go)` </summary>
+If you are editing the API definitions, generate the manifests such as Custom Resources (CRs) or Custom Resource Definitions (CRDs) using
+
+```bash
+make manifests
+```
+
+<details><summary>Click here to see an example. <tt>(api/v1/guestbook_types.go)</tt></summary>
 <p>
 
 ```go
@@ -111,7 +112,7 @@ type GuestbookSpec struct {
 	ConfigMapName string `json:"configMapName"`
 
 	// +kubebuilder:validation:Enum=Phone;Address;Name
-	Type string `json:"alias,omitempty"`
+	Type string `json:"type,omitempty"`
 }
 
 // GuestbookStatus defines the observed state of Guestbook
@@ -144,14 +145,23 @@ type Guestbook struct {
 </details>
 
 
-## Test It Out
+<aside class="note" role="note">
+<p class="note-title"> `+kubebuilder` markers </p>
 
-You'll need a Kubernetes cluster to run against.  You can use
-[KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or
+`+kubebuilder` are [markers][markers] processed by [controller-gen][controller-gen]
+to generate CRDs and RBAC. Kubebuilder also provides [scaffolding markers][scaffolding-markers]
+to inject code into existing files and simplify common tasks. See `cmd/main.go` for examples.
+
+</aside>
+
+## Test it out
+
+You'll need a Kubernetes cluster to run against. You can use
+[KinD][kind] to get a local cluster for testing, or
 run against a remote cluster.
 
-<aside class="note">
-<h1>Context Used</h1>
+<aside class="note" role="note">
+<p class="note-title">Context Used</p>
 
 Your controller will automatically use the current context in your
 kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
@@ -159,26 +169,52 @@ kubeconfig file (i.e. whatever cluster `kubectl cluster-info` shows).
 </aside>
 
 Install the CRDs into the cluster:
+
 ```bash
 make install
 ```
 
-Run your controller (this will run in the foreground, so switch to a new
+For quick feedback and code-level debugging, run your controller (this runs in the foreground, so switch to a new
 terminal if you want to leave it running):
+
 ```bash
 make run
 ```
 
-## Install Instances of Custom Resources
+## Install instances of custom resources
 
-If you pressed `y` for Create Resource [y/n] then you created an (CR)Custom Resource for your (CRD)Custom Resource Definition in your samples (make sure to edit them first if you've changed the
-API definition):
+If you pressed `y` for Create Resource [y/n] then you created a CR for your CRD in your
+`config/samples/` directory.
 
-```bash
-kubectl apply -f config/samples/
+Edit `config/samples/webapp_v1_guestbook.yaml` to contain a valid `spec`. For example:
+
+```yaml
+# ...
+spec:
+  foo: bar
 ```
 
-## Run It On the Cluster
+Hint: "foo" is a string field defined in `api/v1/guestbook_types.go`:
+
+```go
+// foo is an example field of Guestbook. Edit guestbook_types.go to remove/update
+// +optional
+Foo *string `json:"foo,omitempty"`
+```
+
+```bash
+kubectl apply -k config/samples/
+```
+
+You can have a look at your applied resource now:
+
+```bash
+kubectl get guestbooks.webapp.my.domain guestbook-sample -o yaml
+```
+
+## Run it on the cluster
+
+When your controller is ready to be packaged and tested in other clusters.
 
 Build and push your image to the location specified by `IMG`:
 
@@ -192,11 +228,27 @@ Deploy the controller to the cluster with image specified by `IMG`:
 make deploy IMG=<some-registry>/<project-name>:tag
 ```
 
-<aside class="note">
-<h1>RBAC errors</h1>
+<aside class="note" role="note">
+<p class="note-title">Registry Permission</p>
+
+You should publish this image to the personal registry you specified. You also need access to pull the image from the working environment.
+Make sure you have the proper permission to the registry if the above commands do not work.
+
+Consider incorporating [Kind][kind] into your workflow for a faster, more efficient local development and CI experience.
+Note that, if you are using a [Kind][kind] cluster, there is no need to push your image to a remote container registry.
+You can directly load your local image into your specified [Kind][kind] cluster:
+
+```bash
+kind load docker-image <your-image-name>:tag --name <your-kind-cluster-name>
+```
+
+It is highly recommended to use [Kind][kind] for development purposes and CI.
+To know more, see: [Using Kind For Development Purposes and CI](./reference/kind.md)
+
+<p class="note-title">RBAC errors</p>
 
 If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin. See [Prerequisites for using Kubernetes RBAC on GKE cluster v1.11.x and older][pre-rbc-gke] which may be your case.  
+privileges or be logged in as admin. See [Prerequisites for using Kubernetes RBAC on GKE cluster v1.11.x and older][pre-rbc-gke] which may be your case.
 
 </aside>
 
@@ -210,19 +262,60 @@ make uninstall
 
 ## Undeploy controller
 
-UnDeploy the controller to the cluster:
+Undeploy the controller to the cluster:
 
 ```bash
 make undeploy
 ```
+## Using plugins
 
-## Next Step
+Kubebuilder design is based on [Plugins][plugins] and you can use
+[available plugins][available-plugins] to add optional features to your project.
 
-Now, see the [architecture concept diagram][architecture-concept-diagram] for a better overview and follow up the [CronJob tutorial][cronjob-tutorial] to better understand how it works by developing a demo example project.
+<aside class="note" role="note">
+<p class="note-title">References and Examples</p>
+
+Use the [Deploy Image Plugin (deploy-image/v1-alpha)][deploy-image-v1-alpha] as a reference when creating your project. It follows Kubernetes conventions and recommended good practices. For example:
+
+```bash
+kubebuilder create api --group webapp --version v1alpha1 --kind Busybox --image=busybox:1.36.1 --plugins="deploy-image/v1-alpha"
+```
+
+</aside>
+
+<aside class="note" role="note">
+<p class="note-title"> Keeping your project up to date with ecosystem changes </p>
+
+Use [AutoUpdate Plugin][autoupdate-v1-alpha] to keep your project
+aligned with the latest ecosystem changes. When a new release is available,
+it automatically opens an issue with a PR comparison link so you can review and update easily.
+
+```bash
+kubebuilder edit --plugins="autoupdate/v1-alpha"
+```
+
+</aside>
+
+## Next steps
+
+- [Getting Started Guide][getting-started] (~30 min) - build a solid foundation
+- [CronJob Tutorial][cronjob-tutorial] - learn by building a demo project
+- [Groups, Versions, and Kinds][gkv-doc] - understand API design concepts
 
 [pre-rbc-gke]: https://cloud.google.com/kubernetes-engine/docs/how-to/role-based-access-control#iam-rolebinding-bootstrap
-[cronjob-tutorial]: https://book.kubebuilder.io/cronjob-tutorial/cronjob-tutorial.html
-[GOPATH-golang-docs]: https://golang.org/doc/code.html#GOPATH
-[go-module-blogpost]:https://blog.golang.org/using-go-modules
-[envtest]: https://book.kubebuilder.io/reference/testing/envtest.html
+[cronjob-tutorial]: ./cronjob-tutorial/cronjob-tutorial.md
+[GOPATH-golang-docs]: https://go.dev/doc/code.html#GOPATH
+[go-modules-blogpost]: https://blog.go.dev/using-go-modules
 [architecture-concept-diagram]: architecture.md
+[kustomize]: https://github.com/kubernetes-sigs/kustomize
+[getting-started]: getting-started.md
+[plugins]: plugins/plugins.md
+[available-plugins]: plugins/available-plugins.md
+[envtest]: ./reference/envtest.md
+[autoupdate-v1-alpha]: plugins/available/autoupdate-v1-alpha.md
+[deploy-image-v1-alpha]: plugins/available/deploy-image-plugin-v1-alpha.md
+[gkv-doc]: cronjob-tutorial/gvks.md
+[kind]: https://sigs.k8s.io/kind
+[markers]: reference/markers.md
+[controller-gen]: https://sigs.k8s.io/controller-tools/cmd/controller-gen
+[scaffolding-markers]: reference/markers/scaffold.md

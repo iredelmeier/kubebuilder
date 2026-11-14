@@ -18,7 +18,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -36,27 +35,27 @@ Linux:
 MacOS:
   $ %[1]s completion bash > /usr/local/etc/bash_completion.d/%[1]s
 `, c.commandName),
-		RunE: func(cmd *cobra.Command, cmdArgs []string) error {
-			return cmd.Root().GenBashCompletion(os.Stdout)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Root().GenBashCompletionV2(cmd.OutOrStdout(), true)
 		},
 	}
 }
 
 func (c CLI) newZshCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "zsh",
+		Use:   shellZsh,
 		Short: "Load zsh completions",
 		Example: fmt.Sprintf(`# If shell completion is not already enabled in your environment you will need
 # to enable it. You can execute the following once:
 $ echo "autoload -U compinit; compinit" >> ~/.zshrc
 
 # To load completions for each session, execute once:
-$ %[1]s completion zsh > "${fpath[1]}/_%[1]s"
+$ %[1]s completion `+shellZsh+` > "${fpath[1]}/_%[1]s"
 
 # You will need to start a new shell for this setup to take effect.
 `, c.commandName),
-		RunE: func(cmd *cobra.Command, cmdArgs []string) error {
-			return cmd.Root().GenZshCompletion(os.Stdout)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Root().GenZshCompletion(cmd.OutOrStdout())
 		},
 	}
 }
@@ -71,8 +70,8 @@ $ %[1]s completion fish | source
 # To load completions for each session, execute once:
 $ %[1]s completion fish > ~/.config/fish/completions/%[1]s.fish
 `, c.commandName),
-		RunE: func(cmd *cobra.Command, cmdArgs []string) error {
-			return cmd.Root().GenFishCompletion(os.Stdout, true)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Root().GenFishCompletion(cmd.OutOrStdout(), true)
 		},
 	}
 }
@@ -81,8 +80,8 @@ func (CLI) newPowerShellCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "powershell",
 		Short: "Load powershell completions",
-		RunE: func(cmd *cobra.Command, cmdArgs []string) error {
-			return cmd.Root().GenPowerShellCompletion(os.Stdout)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return cmd.Root().GenPowerShellCompletion(cmd.OutOrStdout())
 		},
 	}
 }

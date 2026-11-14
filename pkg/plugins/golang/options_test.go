@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,25 +19,32 @@ package golang
 import (
 	"path"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	cfgv2 "sigs.k8s.io/kubebuilder/v3/pkg/config/v2"
-	cfgv3 "sigs.k8s.io/kubebuilder/v3/pkg/config/v3"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 var _ = Describe("Options", func() {
 	Context("UpdateResource", func() {
 		const (
-			group   = "crew"
-			domain  = "test.io"
-			version = "v1"
-			kind    = "FirstMate"
+			group         = "crew"
+			domain        = "test.io"
+			version       = "v1"
+			kind          = "FirstMate"
+			plural        = "firstmates"
+			controller    = "firstmate"
+			backupControl = "firstmate-backup"
 		)
+
 		var (
+			gvk resource.GVK
+			cfg config.Config
+		)
+
+		BeforeEach(func() {
 			gvk = resource.GVK{
 				Group:   group,
 				Domain:  domain,
@@ -45,10 +52,6 @@ var _ = Describe("Options", func() {
 				Kind:    kind,
 			}
 
-			cfg config.Config
-		)
-
-		BeforeEach(func() {
 			cfg = cfgv3.New()
 			_ = cfg.SetRepository("test")
 		})
@@ -64,7 +67,7 @@ var _ = Describe("Options", func() {
 
 					res := resource.Resource{
 						GVK:      gvk,
-						Plural:   "firstmates",
+						Plural:   plural,
 						API:      &resource.API{},
 						Webhooks: &resource.Webhooks{},
 					}
@@ -78,33 +81,42 @@ var _ = Describe("Options", func() {
 					if options.DoAPI || options.DoDefaulting || options.DoValidation || options.DoConversion {
 						if multiGroup {
 							Expect(res.Path).To(Equal(
-								path.Join(cfg.GetRepository(), "apis", gvk.Group, gvk.Version)))
+								path.Join(cfg.GetRepository(), "api", gvk.Group, gvk.Version)))
 						} else {
 							Expect(res.Path).To(Equal(path.Join(cfg.GetRepository(), "api", gvk.Version)))
 						}
+					} else if len(options.ExternalAPIPath) > 0 {
+						Expect(res.Path).To(Equal("github.com/example/external/api/v1"))
 					} else {
 						// Core-resources have a path despite not having an API/Webhook but they are not tested here
 						Expect(res.Path).To(Equal(""))
 					}
 					Expect(res.API).NotTo(BeNil())
 					if options.DoAPI {
-						Expect(res.API.CRDVersion).To(Equal(options.CRDVersion))
 						Expect(res.API.Namespaced).To(Equal(options.Namespaced))
+						Expect(res.API.SSA).To(Equal(options.SSA))
 						Expect(res.API.IsEmpty()).To(BeFalse())
 					} else {
 						Expect(res.API.IsEmpty()).To(BeTrue())
 					}
-					Expect(res.Controller).To(Equal(options.DoController))
+					Expect(res.Controller).To(BeFalse()) //nolint:staticcheck // asserting it stays unwritten
+					Expect(res.HasController()).To(Equal(options.DoController))
 					Expect(res.Webhooks).NotTo(BeNil())
 					if options.DoDefaulting || options.DoValidation || options.DoConversion {
-						Expect(res.Webhooks.WebhookVersion).To(Equal(options.WebhookVersion))
 						Expect(res.Webhooks.Defaulting).To(Equal(options.DoDefaulting))
 						Expect(res.Webhooks.Validation).To(Equal(options.DoValidation))
 						Expect(res.Webhooks.Conversion).To(Equal(options.DoConversion))
+						Expect(res.Webhooks.Spoke).To(Equal(options.Spoke))
 						Expect(res.Webhooks.IsEmpty()).To(BeFalse())
 					} else {
 						Expect(res.Webhooks.IsEmpty()).To(BeTrue())
 					}
+
+					if len(options.ExternalAPIPath) > 0 {
+						Expect(res.External).To(BeTrue())
+						Expect(res.Domain).To(Equal("test.io"))
+					}
+
 					Expect(res.QualifiedGroup()).To(Equal(gvk.Group + "." + gvk.Domain))
 					Expect(res.PackageName()).To(Equal(gvk.Group))
 					Expect(res.ImportAlias()).To(Equal(gvk.Group + gvk.Version))
@@ -112,11 +124,110 @@ var _ = Describe("Options", func() {
 			},
 			Entry("when updating nothing", Options{}),
 			Entry("when updating the plural", Options{Plural: "mates"}),
-			Entry("when updating the API", Options{DoAPI: true, CRDVersion: "v1", Namespaced: true}),
 			Entry("when updating the Controller", Options{DoController: true}),
-			Entry("when updating Webhooks",
-				Options{WebhookVersion: "v1", DoDefaulting: true, DoValidation: true, DoConversion: true}),
+			Entry("when updating with External API Path",
+				Options{ExternalAPIPath: "github.com/example/external/api/v1", ExternalAPIDomain: "test.io"}),
+			Entry("when updating the API with setting webhooks params",
+				Options{DoAPI: true, DoDefaulting: true, DoValidation: true, DoConversion: true}),
+			Entry("when updating the API with SSA enabled", Options{DoAPI: true, SSA: true}),
 		)
+
+		Context("recording controllers", func() {
+			var res resource.Resource
+
+			BeforeEach(func() {
+				res = resource.Resource{
+					GVK:      gvk,
+					Plural:   plural,
+					API:      &resource.API{},
+					Webhooks: &resource.Webhooks{},
+				}
+			})
+
+			It("should record the default kind-based name when none is given", func() {
+				Options{DoController: true}.UpdateResource(&res, cfg)
+
+				Expect(res.GetControllerNames()).To(Equal([]string{controller}))
+			})
+
+			It("should record the given controller name", func() {
+				Options{DoController: true, ControllerName: backupControl}.UpdateResource(&res, cfg)
+
+				Expect(res.GetControllerNames()).To(Equal([]string{backupControl}))
+			})
+
+			It("should carry a legacy controller into the list before adding a new one", func() {
+				res.Controller = true //nolint:staticcheck // simulating a project read from an old PROJECT file
+
+				Options{DoController: true, ControllerName: backupControl}.UpdateResource(&res, cfg)
+
+				Expect(res.Controller).To(BeFalse()) //nolint:staticcheck // asserting it stays unwritten
+				Expect(res.GetControllerNames()).To(Equal([]string{controller, backupControl}))
+			})
+
+			It("should not duplicate a controller that is already recorded", func() {
+				Options{DoController: true}.UpdateResource(&res, cfg)
+				Options{DoController: true}.UpdateResource(&res, cfg)
+
+				Expect(res.GetControllerNames()).To(Equal([]string{controller}))
+			})
+
+			It("should record nothing when no controller is requested", func() {
+				Options{}.UpdateResource(&res, cfg)
+
+				Expect(res.HasController()).To(BeFalse())
+			})
+		})
+
+		It("should retain path and external flag when ExternalAPIPath is not provided but resource is already external",
+			func() {
+				const externalPath = "github.com/example/external/api/v1"
+
+				res := resource.Resource{
+					GVK:      gvk,
+					Plural:   plural,
+					External: true,
+					Path:     externalPath,
+					API:      &resource.API{},
+					Webhooks: &resource.Webhooks{},
+				}
+
+				Options{DoController: true}.UpdateResource(&res, cfg)
+
+				Expect(res.External).To(BeTrue())
+				Expect(res.Path).To(Equal(externalPath))
+				Expect(res.Validate()).To(Succeed())
+			})
+
+		It("should preserve res.Domain when ExternalAPIDomain is not supplied in !alreadyHasAPI block",
+			func() {
+				const externalPath = "github.com/example/external/api/v1"
+				const externalDomain = "example.com"
+
+				res := resource.Resource{
+					GVK: resource.GVK{
+						Group:   group,
+						Domain:  externalDomain,
+						Version: version,
+						Kind:    kind,
+					},
+					Plural:   plural,
+					External: true,
+					Path:     externalPath,
+					API:      &resource.API{},
+					Webhooks: &resource.Webhooks{},
+				}
+
+				// DoDefaulting without ExternalAPIPath — simulates webhook flow without re-providing the flag
+				Options{DoDefaulting: true}.UpdateResource(&res, cfg)
+
+				Expect(res.External).To(BeTrue())
+				Expect(res.GVK.Domain).To(Equal(externalDomain),
+					"domain must not be zeroed out when ExternalAPIDomain is empty")
+				Expect(res.Path).To(Equal(externalPath),
+					"path must not be clobbered by webhook block for external resource")
+				Expect(res.Validate()).To(Succeed())
+			})
 
 		DescribeTable("should use core apis",
 			func(group, qualified string) {
@@ -135,7 +246,7 @@ var _ = Describe("Options", func() {
 							Version: version,
 							Kind:    kind,
 						},
-						Plural:   "firstmates",
+						Plural:   plural,
 						API:      &resource.API{},
 						Webhooks: &resource.Webhooks{},
 					}
@@ -157,7 +268,7 @@ var _ = Describe("Options", func() {
 			// the `HasAPI` method of the resource obtained with `GetResource` will always return false.
 			// Instead, the existence of a resource in the list means the API was scaffolded.
 			func(group, qualified string) {
-				cfg = cfgv2.New()
+				cfg = cfgv3.New()
 				_ = cfg.SetRepository("test")
 
 				options := Options{}
@@ -175,7 +286,7 @@ var _ = Describe("Options", func() {
 							Version: version,
 							Kind:    kind,
 						},
-						Plural:   "firstmates",
+						Plural:   plural,
 						API:      &resource.API{},
 						Webhooks: &resource.Webhooks{},
 					}

@@ -17,20 +17,19 @@ limitations under the License.
 package stage
 
 import (
-	"sort"
+	"slices"
 	"testing"
 
-	g "github.com/onsi/ginkgo" // An alias is required because Context is defined elsewhere in this package.
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2" // An alias is required because Context is defined elsewhere in this package.
 	. "github.com/onsi/gomega"
 )
 
 func TestStage(t *testing.T) {
-	RegisterFailHandler(g.Fail)
-	g.RunSpecs(t, "Stage Suite")
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "Stage Suite")
 }
 
-var _ = g.Describe("ParseStage", func() {
+var _ = Describe("ParseStage", func() {
 	DescribeTable("should be correctly parsed for valid stage strings",
 		func(str string, stage Stage) {
 			s, err := ParseStage(str)
@@ -53,8 +52,8 @@ var _ = g.Describe("ParseStage", func() {
 	)
 })
 
-var _ = g.Describe("Stage", func() {
-	g.Context("String", func() {
+var _ = Describe("Stage", func() {
+	Context("String", func() {
 		DescribeTable("should return the correct string value",
 			func(stage Stage, str string) { Expect(stage.String()).To(Equal(str)) },
 			Entry("for alpha stage", Alpha, "alpha"),
@@ -71,7 +70,7 @@ var _ = g.Describe("Stage", func() {
 		)
 	})
 
-	g.Context("Validate", func() {
+	Context("Validate", func() {
 		DescribeTable("should validate existing stages",
 			func(stage Stage) { Expect(stage.Validate()).To(Succeed()) },
 			Entry("for alpha stage", Alpha),
@@ -88,9 +87,14 @@ var _ = g.Describe("Stage", func() {
 		)
 	})
 
-	g.Context("Compare", func() {
+	Context("Compare", func() {
 		// Test Stage.Compare by sorting a list
 		var (
+			stages       []Stage
+			sortedStages []Stage
+		)
+
+		BeforeEach(func() {
 			stages = []Stage{
 				Stable,
 				Alpha,
@@ -108,18 +112,18 @@ var _ = g.Describe("Stage", func() {
 				Stable,
 				Stable,
 			}
-		)
+		})
 
-		g.It("sorts stages correctly", func() {
-			sort.Slice(stages, func(i int, j int) bool {
-				return stages[i].Compare(stages[j]) == -1
+		It("sorts stages correctly", func() {
+			slices.SortStableFunc(stages, func(a, b Stage) int {
+				return a.Compare(b)
 			})
 			Expect(stages).To(Equal(sortedStages))
 		})
 	})
 
-	g.Context("IsStable", func() {
-		g.It("should return true for stable stage", func() {
+	Context("IsStable", func() {
+		It("should return true for stable stage", func() {
 			Expect(Stable.IsStable()).To(BeTrue())
 		})
 

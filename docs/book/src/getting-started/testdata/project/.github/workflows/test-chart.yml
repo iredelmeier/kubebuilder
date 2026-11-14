@@ -1,0 +1,84 @@
+name: Test Chart
+
+on:
+  push:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  test-e2e:
+    permissions:
+      contents: read
+    name: Run on Ubuntu
+    runs-on: ubuntu-latest
+    env:
+      IMG: controller:latest
+      CERT_MANAGER_VERSION: v1.21.3
+      PROMETHEUS_OPERATOR_CRDS_VERSION: 32.0.2
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+        with:
+          go-version-file: go.mod
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-$(go env GOARCH)
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Verify kind installation
+        run: kind version
+
+      - name: Create kind cluster
+        run: kind create cluster
+
+      - name: Prepare project
+        run: |
+          go mod tidy
+          make docker-build
+          kind load docker-image "$IMG"
+
+      - name: Install Helm
+        run: |
+          make helm
+          # Use the Helm installed by make helm in the next steps
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+
+      - name: Lint Helm Chart
+        run: helm lint ./dist/chart
+
+# TODO: Uncomment if cert-manager is enabled
+#      - name: Install cert-manager via Helm (wait for readiness)
+#        run: |
+#          helm repo add jetstack https://charts.jetstack.io
+#          helm repo update
+#          helm install cert-manager jetstack/cert-manager \
+#            --version ${CERT_MANAGER_VERSION} \
+#            --namespace cert-manager \
+#            --create-namespace \
+#            --set crds.enabled=true \
+#            --wait \
+#            --timeout 300s
+
+# TODO: Uncomment if Prometheus is enabled
+#      - name: Install Prometheus Operator CRDs
+#        run: |
+#          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+#          helm repo update
+#          helm install prometheus-crds prometheus-community/prometheus-operator-crds \
+#            --version ${PROMETHEUS_OPERATOR_CRDS_VERSION}
+
+      - name: Deploy manager via Helm
+        run: |
+          make helm-deploy
+
+      - name: Check Helm release status
+        run: |
+          make helm-status

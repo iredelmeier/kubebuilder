@@ -7,6 +7,12 @@
  * extract the actual relevant information.  Theoretically, this'll let us do
  * stuff like transform the information for different screen widths. */
 
+/* Removes the counter from marker definitions */
+dd:has(+ dd)::before,
+dd + dd::before {
+    content: normal;
+}
+
 /* the marker */
 .marker {
     display: flex;
@@ -15,13 +21,8 @@
     margin-bottom: 0.25em;
 }
 
-/* the marker name */
-.marker > dt.name::before {
-    content: '// +';
-}
 .marker > dt.name {
     font-weight: bold;
-    order: 0; /* hack around the ::before's positioning to get it after the line */
 }
 
 /* the target blob */
@@ -70,14 +71,14 @@
     font-style: inherit;
 }
 .marker dl.args.summary dt:first-child::before {
-    content: ':';
+    content: ":";
 }
 .marker dl.args.summary dt::before {
-    content: ',';
+    content: ",";
 }
 /* hide in non-summary view */
 .marker dd.args {
-    display: none
+    display: none;
 }
 
 /* the description */
@@ -90,7 +91,7 @@
 
 /* all arguments */
 .marker dl.args dt.argument::after {
-    content: '=';
+    content: "=";
 }
 .marker dl.args dd.type {
     font-style: italic;
@@ -103,14 +104,16 @@
     font-size: 0.875em;
 }
 .marker .literal {
-    font-family: "Source Code Pro", Consolas, "Ubuntu Mono", Menlo, "DejaVu Sans Mono", monospace, monospace;
+    font-family:
+        "Source Code Pro", Consolas, "Ubuntu Mono", Menlo, "DejaVu Sans Mono",
+        monospace, monospace;
     font-size: 0.875em; /* please adjust the ace font size accordingly in editor.js */
 }
 .marker .argument.type::before {
-    content: '‹';
+    content: "‹";
 }
 .marker .argument.type::after {
-    content: '›';
+    content: "›";
 }
 
 /* summary args */
@@ -139,7 +142,7 @@
 }
 
 .marker .type .slice::before {
-    content: '[]';
+    content: "[]";
 }
 
 /* description args */
@@ -163,10 +166,10 @@
 
 /* summary view */
 .markers-summarize:checked ~ dl > .marker dd.args {
-    display: inline-block
+    display: inline-block;
 }
 .markers-summarize:checked ~ dl > .marker dd.description dl.args {
-    display: none
+    display: none;
 }
 .markers-summarize:checked ~ dl > .marker dd.description {
     margin-bottom: 0.25em;
@@ -177,11 +180,11 @@ input.markers-summarize {
 }
 label.markers-summarize::before {
     margin-right: 0.5em;
-    content: '\25bc';
+    content: "\25bc";
     display: inline-block;
 }
 input.markers-summarize:checked ~ label.markers-summarize::before {
-    content: '\25b6';
+    content: "\25b6";
 }
 
 /* misc */
@@ -215,6 +218,11 @@ input.markers-summarize:checked ~ label.markers-summarize::before {
 .literate cite.literate-source + * {
     /* a bit of margin against the cite element */
     margin-top: 0.125em;
+}
+
+/* Completely hide low-value collapsed sections (license text, imports) */
+details.collapse-hide {
+    display: none;
 }
 
 /* details elements (not markers) */
@@ -253,6 +261,10 @@ details.collapse-code[open] > summary pre span::after {
     content: "";
 }
 
+details.collapse-code > summary pre span.collapse-summary::before {
+    content: "// ";
+}
+
 details.collapse-code > summary pre span::before {
     content: "// ";
 }
@@ -276,7 +288,6 @@ details.collapse-code > summary::-webkit-details-marker {
     display: none;
 }
 
-
 /* diagrams */
 
 .diagrams {
@@ -292,12 +303,15 @@ details.collapse-code > summary::-webkit-details-marker {
     font-weight: bold;
 }
 
-.diagrams object, .diagrams svg {
+.diagrams object,
+.diagrams svg {
     max-width: 100%;
     max-height: 10em; /* force svg height to behave */
 }
 
-.diagrams path, .diagrams polyline, .diagrams circle {
+.diagrams path,
+.diagrams polyline,
+.diagrams circle {
     stroke: var(--fg);
 }
 
@@ -311,33 +325,48 @@ details.collapse-code > summary::-webkit-details-marker {
     stroke: none;
 }
 
-/* notes */
-aside.note {
-    border: 1px solid var(--searchbar-border-color);
+/* notes - base styles for both info and warning */
+aside.note,
+aside.warning {
+    border: 1px solid var(--searchbar-border-color) !important;
+    border-left: 1px solid var(--searchbar-border-color) !important;
     border-radius: 3px;
     margin-top: 1em;
+    padding: 0 !important;
+    background: transparent !important;
 }
 
-aside.note > * {
+/* Hide mdBook's default callout icons that appear outside the box */
+aside.note::before,
+aside.warning::before {
+    display: none !important;
+    content: none !important;
+}
+
+aside.note > *,
+aside.warning > * {
     margin-left: 1em;
     margin-right: 1em;
 }
 
-/* note title */
-aside.note > h1 {
+/* note title - default styling (info/regular notes) */
+aside.note > .note-title,
+aside.warning > .note-title {
     border-bottom: 1px solid var(--searchbar-border-color);
-    margin: 0;
+    margin: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
     padding: 0.5em 1em;
     font-size: 100%;
     font-weight: normal;
     background: var(--quote-bg);
 }
 
-/* warning notes */
-aside.note.warning > h1 {
+/* warning notes - orange styling with icon */
+aside.warning > .note-title {
     background: var(--warning-note-background-color, #fcf8f2);
 }
-aside.note.warning > h1::before {
+aside.warning > .note-title::before {
     /* TODO(directxman12): fill in these colors in theme.
      * If you're good with colors, feel free to play around with this
      * in dark mode. */
@@ -356,7 +385,9 @@ aside.note.warning > h1::before {
 /* literate source citations */
 cite.literate-source {
     font-size: 75%;
-    font-family: "Source Code Pro", Consolas, "Ubuntu Mono", Menlo, "DejaVu Sans Mono", monospace, monospace;
+    font-family:
+        "Source Code Pro", Consolas, "Ubuntu Mono", Menlo, "DejaVu Sans Mono",
+        monospace, monospace;
 }
 cite.literate-source::before {
     content: "$ ";
@@ -368,11 +399,6 @@ cite.literate-source > a::before {
     content: "vim ";
     font-style: normal;
     color: var(--fg);
-}
-
-/* hide the annoying "copy to clipboard" buttons */
-.literate pre > .buttons {
-    display: none;
 }
 
 /* add a bit of extra padding for readability */

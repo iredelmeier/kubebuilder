@@ -1,0 +1,346 @@
+/*
+Copyright 2026 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package extractor
+
+import (
+	"strings"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+)
+
+// FeaturesExtractor detects features from resources.
+type FeaturesExtractor struct{}
+
+// FeatureSet represents detected features in the resources.
+// It includes flags for CRDs, webhooks, metrics, Prometheus, cert-manager,
+// NetworkPolicies, NetworkPolicy traffic paths, and cluster-scoped RBAC.
+// It also includes port configurations and multi-namespace RBAC mappings.
+type FeatureSet struct {
+	HasCRDs                 bool
+	HasWebhooks             bool
+	HasMetrics              bool
+	HasPrometheus           bool
+	HasCertManager          bool
+	HasNetworkPolicy        bool
+	HasMetricsNetworkPolicy bool
+	HasWebhookNetworkPolicy bool
+	HasClusterScopedRBAC    bool
+	WebhookPort             int
+	MetricsPort             int
+	HealthProbeBindAddress  string // empty when the manager does not set --health-probe-bind-address
+	MetricsSecure           *bool  // nil when the manager does not set --metrics-secure
+	RoleNamespaces          map[string]string
+}
+
+// DetectFeatures detects features from parsed resources.
+// The namePrefix is the project prefix used in resource names.
+// The managerNamespace is the namespace where the manager deployment runs.
+func (f *FeaturesExtractor) DetectFeatures(resources *ResourceSet, namePrefix, managerNamespace string) FeatureSet {
+	features := FeatureSet{
+		WebhookPort:    9443,
+		MetricsPort:    8443,
+		RoleNamespaces: make(map[string]string),
+	}
+
+	features.HasCRDs = len(resources.CustomResourceDefinitions) > 0
+	features.HasWebhooks = len(resources.WebhookConfigurations) > 0 ||
+		hasConversionWebhooks(resources.CustomResourceDefinitions)
+
+	features.HasCertManager = resources.Issuer != nil || len(resources.Certificates) > 0
+
+	features.HasPrometheus = len(resources.ServiceMonitors) > 0
+	features.HasNetworkPolicy = len(resources.NetworkPolicies) > 0
+	for _, policy := range resources.NetworkPolicies {
+		name := policy.GetName()
+		if strings.HasSuffix(name, "allow-metrics-traffic") {
+			features.HasMetricsNetworkPolicy = true
+		}
+		if strings.HasSuffix(name, "allow-webhook-traffic") {
+			features.HasWebhookNetworkPolicy = true
+		}
+	}
+
+	for _, svc := range resources.Services {
+		name := svc.GetName()
+		if strings.HasSuffix(name, "-metrics-service") || strings.HasSuffix(name, "-controller-manager-metrics-service") {
+			features.HasMetrics = true
+			if port := extractPortFromService(svc); port > 0 {
+				features.MetricsPort = port
+			}
+			break
+		}
+	}
+
+	if features.HasWebhooks {
+		webhookPortFromDeployment := false
+		if resources.Deployment != nil {
+			if port := extractWebhookPortFromDeployment(resources.Deployment); port > 0 {
+				features.WebhookPort = port
+				webhookPortFromDeployment = true
+			}
+		}
+
+		// The webhook server listens on the Service targetPort (the pod port), not the exposed 443.
+		if !webhookPortFromDeployment {
+			for _, svc := range resources.Services {
+				name := svc.GetName()
+				if strings.HasSuffix(name, "-webhook-service") {
+					if port := extractTargetPortFromService(svc); port > 0 {
+						features.WebhookPort = port
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// The health probe address is the manager container's --health-probe-bind-address arg.
+	if resources.Deployment != nil {
+		features.HealthProbeBindAddress = extractHealthProbeBindAddressFromDeployment(resources.Deployment)
+	}
+
+	// Whether metrics are served over HTTPS is defined on the manager container's --metrics-secure arg.
+	if resources.Deployment != nil {
+		if secure, found := extractMetricsSecureFromDeployment(resources.Deployment); found {
+			features.MetricsSecure = &secure
+		}
+	}
+
+	// Detect cluster-scoped RBAC for business logic.
+	// Kubebuilder scaffolds metrics-auth-role and metrics-reader which must remain cluster-scoped.
+	// This checks if there are additional ClusterRoles for business logic that can be converted to
+	// namespace-scoped Roles via the rbac.namespaced toggle.
+	for _, cr := range resources.ClusterRoles {
+		name := cr.GetName()
+		if strings.HasSuffix(name, "-metrics-auth-role") || strings.HasSuffix(name, "-metrics-reader") {
+			continue
+		}
+		features.HasClusterScopedRBAC = true
+		break
+	}
+
+	// Collect Roles and RoleBindings that deploy to namespaces other than the manager namespace.
+	// This enables multi-namespace RBAC scenarios.
+	for _, role := range resources.Roles {
+		ns := role.GetNamespace()
+		if ns != "" && ns != managerNamespace {
+			roleName := role.GetName()
+			suffix := strings.TrimPrefix(roleName, namePrefix+"-")
+			features.RoleNamespaces[suffix] = ns
+		}
+	}
+	for _, binding := range resources.RoleBindings {
+		ns := binding.GetNamespace()
+		if ns != "" && ns != managerNamespace {
+			bindingName := binding.GetName()
+			suffix := strings.TrimPrefix(bindingName, namePrefix+"-")
+			features.RoleNamespaces[suffix] = ns
+		}
+	}
+
+	return features
+}
+
+// firstServicePort returns the first entry of a service's spec.ports, or false when absent.
+func firstServicePort(svc *unstructured.Unstructured) (map[string]any, bool) {
+	ports, found, err := unstructured.NestedFieldNoCopy(svc.Object, "spec", "ports")
+	if !found || err != nil {
+		return nil, false
+	}
+
+	portsList, ok := ports.([]any)
+	if !ok || len(portsList) == 0 {
+		return nil, false
+	}
+
+	firstPort, ok := portsList[0].(map[string]any)
+	return firstPort, ok
+}
+
+// extractPortFromService extracts the exposed port of a service's first port.
+func extractPortFromService(svc *unstructured.Unstructured) int {
+	firstPort, ok := firstServicePort(svc)
+	if !ok {
+		return 0
+	}
+
+	port, _ := toInt(firstPort["port"])
+	return port
+}
+
+// extractTargetPortFromService returns the numeric targetPort of a Service's first port.
+// It returns 0 for a named targetPort because the pod port cannot be resolved here.
+func extractTargetPortFromService(svc *unstructured.Unstructured) int {
+	firstPort, ok := firstServicePort(svc)
+	if !ok {
+		return 0
+	}
+
+	if targetPort, ok := toInt(firstPort["targetPort"]); ok && targetPort > 0 {
+		return targetPort
+	}
+
+	if _, named := firstPort["targetPort"].(string); named {
+		return 0
+	}
+
+	port, _ := toInt(firstPort["port"])
+	return port
+}
+
+func hasConversionWebhooks(crds []*unstructured.Unstructured) bool {
+	for _, crd := range crds {
+		strategy, found, err := unstructured.NestedString(crd.Object, "spec", "conversion", "strategy")
+		if err == nil && found && strategy == "Webhook" {
+			return true
+		}
+	}
+	return false
+}
+
+// extractWebhookPortFromDeployment extracts the webhook port from the manager
+// container's --webhook-port argument, or from the container ports.
+func extractWebhookPortFromDeployment(deployment *unstructured.Unstructured) int {
+	specMap := extractDeploymentSpec(deployment)
+	if specMap == nil {
+		return 0
+	}
+	container := findManagerContainer(deployment, specMap)
+	if container == nil {
+		return 0
+	}
+
+	// The manager binds the port from its --webhook-port argument, so that
+	// value wins over the declared container port.
+	if argsField, found, err := unstructured.NestedFieldNoCopy(container, "args"); found && err == nil {
+		if argsList, ok := argsField.([]any); ok {
+			for _, a := range argsList {
+				if strArg, ok := a.(string); ok && strings.Contains(strArg, "--webhook-port") {
+					if port := ExtractPortFromArg(strArg); port > 0 {
+						return port
+					}
+				}
+			}
+		}
+	}
+
+	portsField, found, err := unstructured.NestedFieldNoCopy(container, "ports")
+	if !found || err != nil {
+		return 0
+	}
+
+	portsList, ok := portsField.([]any)
+	if !ok {
+		return 0
+	}
+
+	for _, p := range portsList {
+		portMap, ok := p.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		name, _ := portMap["name"].(string)
+		if isWebhookPortName(name) {
+			if cp, ok := toInt(portMap["containerPort"]); ok {
+				return cp
+			}
+		}
+	}
+
+	return 0
+}
+
+// extractHealthProbeBindAddressFromDeployment returns the address from the manager
+// container's --health-probe-bind-address argument, for example ":8081" or
+// "localhost:9440", or "0" when the manager turns its health probe server off. It returns
+// "" when the manager does not set the argument or its address has no valid port.
+// controller-runtime also turns the server off for an empty address, but in the chart an
+// empty value means no flag, so an explicit empty address is returned as "0".
+func extractHealthProbeBindAddressFromDeployment(deployment *unstructured.Unstructured) string {
+	specMap := extractDeploymentSpec(deployment)
+	if specMap == nil {
+		return ""
+	}
+	container := findManagerContainer(deployment, specMap)
+	if container == nil {
+		return ""
+	}
+
+	argsField, found, err := unstructured.NestedFieldNoCopy(container, "args")
+	if !found || err != nil {
+		return ""
+	}
+
+	argsList, ok := argsField.([]any)
+	if !ok {
+		return ""
+	}
+
+	const flagPrefix = "--health-probe-bind-address="
+	for _, a := range argsList {
+		strArg, ok := a.(string)
+		if !ok || !strings.HasPrefix(strArg, flagPrefix) {
+			continue
+		}
+		address := strings.TrimPrefix(strArg, flagPrefix)
+		if address == "" || address == "0" {
+			return "0"
+		}
+		if ExtractPortFromArg(strArg) > 0 {
+			return address
+		}
+	}
+
+	return ""
+}
+
+// extractMetricsSecureFromDeployment extracts whether metrics are served over
+// HTTPS from the manager container's --metrics-secure argument. The second
+// return value reports whether the argument is set.
+func extractMetricsSecureFromDeployment(deployment *unstructured.Unstructured) (bool, bool) {
+	specMap := extractDeploymentSpec(deployment)
+	if specMap == nil {
+		return false, false
+	}
+	container := findManagerContainer(deployment, specMap)
+	if container == nil {
+		return false, false
+	}
+
+	argsField, found, err := unstructured.NestedFieldNoCopy(container, "args")
+	if !found || err != nil {
+		return false, false
+	}
+
+	argsList, ok := argsField.([]any)
+	if !ok {
+		return false, false
+	}
+
+	for _, a := range argsList {
+		strArg, ok := a.(string)
+		if !ok {
+			continue
+		}
+		if secure, ok := ExtractMetricsSecureFromArg(strArg); ok {
+			return secure, true
+		}
+	}
+
+	return false, false
+}

@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@ limitations under the License.
 package config
 
 import (
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 // Config defines the interface that project configuration types must follow.
@@ -26,6 +26,12 @@ type Config interface {
 
 	// GetVersion returns the current project version.
 	GetVersion() Version
+
+	// GetCliVersion returns the CLI binary version that was used to scaffold or initialize the project.
+	GetCliVersion() string
+
+	// SetCliVersion sets the binary version used to initialize the project.
+	SetCliVersion(version string) error
 
 	/* String fields */
 
@@ -62,15 +68,12 @@ type Config interface {
 	// ClearMultiGroup disables multi-group.
 	ClearMultiGroup() error
 
-	// IsComponentConfig checks if component config is enabled.
-	// This method was introduced in project version 3.
-	IsComponentConfig() bool
-	// SetComponentConfig enables component config.
-	// This method was introduced in project version 3.
-	SetComponentConfig() error
-	// ClearComponentConfig disables component config.
-	// This method was introduced in project version 3.
-	ClearComponentConfig() error
+	// IsNamespaced checks if the project is configured for namespace-scoped deployment.
+	IsNamespaced() bool
+	// SetNamespaced enables namespace-scoped deployment.
+	SetNamespaced() error
+	// ClearNamespaced disables namespace-scoped deployment (default: cluster-scoped).
+	ClearNamespaced() error
 
 	/* Resources */
 
@@ -98,15 +101,15 @@ type Config interface {
 
 	// DecodePluginConfig decodes a plugin config stored in Config into configObj, which must be a pointer.
 	// This method is intended to be used for custom configuration objects, which were introduced in project version 3.
-	DecodePluginConfig(key string, configObj interface{}) error
+	DecodePluginConfig(key string, configObj any) error
 	// EncodePluginConfig encodes a config object into Config by overwriting the existing object stored under key.
 	// This method is intended to be used for custom configuration objects, which were introduced in project version 3.
-	EncodePluginConfig(key string, configObj interface{}) error
+	EncodePluginConfig(key string, configObj any) error
 
 	/* Persistence */
 
-	// Marshal returns the YAML representation of the Config.
+	// MarshalYAML Marshal returns the YAML representation of the Config.
 	MarshalYAML() ([]byte, error)
-	// Unmarshal loads the Config fields from its YAML representation.
+	// UnmarshalYAML Unmarshal loads the Config fields from its YAML representation.
 	UnmarshalYAML([]byte) error
 }

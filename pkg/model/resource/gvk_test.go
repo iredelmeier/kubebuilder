@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,48 +19,57 @@ package resource
 import (
 	"strings"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("GVK", func() {
 	const (
-		group   = "group"
-		domain  = "my.domain"
-		version = "v1"
-		kind    = "Kind"
+		group           = "group"
+		domain          = "my.domain"
+		version         = "v1"
+		kind            = "Kind"
+		internalVersion = "__internal"
+		invalidGVKChars = "_*?"
 	)
 
-	var gvk = GVK{Group: group, Domain: domain, Version: version, Kind: kind}
+	var gvk GVK
+
+	BeforeEach(func() {
+		gvk = GVK{Group: group, Domain: domain, Version: version, Kind: kind}
+	})
 
 	Context("Validate", func() {
-		It("should succeed for a valid GVK", func() {
-			Expect(gvk.Validate()).To(Succeed())
-		})
+		DescribeTable("should pass valid GVKs",
+			func(get func() GVK) {
+				Expect(get().Validate()).To(Succeed())
+			},
+			Entry("Standard GVK", func() GVK { return gvk }),
+			Entry("Version (__internal)", func() GVK {
+				return GVK{Group: group, Domain: domain, Version: internalVersion, Kind: kind}
+			}),
+		)
 
 		DescribeTable("should fail for invalid GVKs",
 			func(gvk GVK) { Expect(gvk.Validate()).NotTo(Succeed()) },
 			// Ensure that the rest of the fields are valid to check each part
 			Entry("Group (uppercase)", GVK{Group: "Group", Domain: domain, Version: version, Kind: kind}),
-			Entry("Group (non-alpha characters)", GVK{Group: "_*?", Domain: domain, Version: version, Kind: kind}),
+			Entry("Group (non-alpha characters)", GVK{Group: invalidGVKChars, Domain: domain, Version: version, Kind: kind}),
 			Entry("Domain (uppercase)", GVK{Group: group, Domain: "Domain", Version: version, Kind: kind}),
-			Entry("Domain (non-alpha characters)", GVK{Group: group, Domain: "_*?", Version: version, Kind: kind}),
+			Entry("Domain (non-alpha characters)", GVK{Group: group, Domain: invalidGVKChars, Version: version, Kind: kind}),
 			Entry("Group and Domain (empty)", GVK{Group: "", Domain: "", Version: version, Kind: kind}),
 			Entry("Version (empty)", GVK{Group: group, Domain: domain, Version: "", Kind: kind}),
-			Entry("Version (no v prefix)", GVK{Group: group, Domain: domain, Version: "1", Kind: kind}),
-			Entry("Version (wrong prefix)", GVK{Group: group, Domain: domain, Version: "a1", Kind: kind}),
-			Entry("Version (unstable no v prefix)", GVK{Group: group, Domain: domain, Version: "1beta1", Kind: kind}),
-			Entry("Version (unstable no alpha/beta number)",
-				GVK{Group: group, Domain: domain, Version: "v1beta", Kind: kind}),
-			Entry("Version (multiple unstable)",
-				GVK{Group: group, Domain: domain, Version: "v1beta1alpha1", Kind: kind}),
+			Entry("Version (wrong prefix)", GVK{Group: group, Domain: domain, Version: "-example.com", Kind: kind}),
+			Entry("Version (wrong suffix)", GVK{Group: group, Domain: domain, Version: "example.com-", Kind: kind}),
+			Entry("Version (uppercase)", GVK{Group: group, Domain: domain, Version: "Example.com", Kind: kind}),
+			Entry("Version (special characters)", GVK{Group: group, Domain: domain, Version: "example!domain.com", Kind: kind}),
+			Entry("Version (consecutive dots)", GVK{Group: group, Domain: domain, Version: "example..com", Kind: kind}),
 			Entry("Kind (empty)", GVK{Group: group, Domain: domain, Version: version, Kind: ""}),
 			Entry("Kind (whitespaces)", GVK{Group: group, Domain: domain, Version: version, Kind: "Ki nd"}),
 			Entry("Kind (lowercase)", GVK{Group: group, Domain: domain, Version: version, Kind: "kind"}),
 			Entry("Kind (starts with number)", GVK{Group: group, Domain: domain, Version: version, Kind: "1Kind"}),
 			Entry("Kind (ends with `-`)", GVK{Group: group, Domain: domain, Version: version, Kind: "Kind-"}),
-			Entry("Kind (non-alpha characters)", GVK{Group: group, Domain: domain, Version: version, Kind: "_*?"}),
+			Entry("Kind (non-alpha characters)", GVK{Group: group, Domain: domain, Version: version, Kind: invalidGVKChars}),
 			Entry("Kind (too long)",
 				GVK{Group: group, Domain: domain, Version: version, Kind: strings.Repeat("a", 64)}),
 		)
@@ -68,10 +77,16 @@ var _ = Describe("GVK", func() {
 
 	Context("QualifiedGroup", func() {
 		DescribeTable("should return the correct string",
-			func(gvk GVK, qualifiedGroup string) { Expect(gvk.QualifiedGroup()).To(Equal(qualifiedGroup)) },
-			Entry("fully qualified resource", gvk, group+"."+domain),
-			Entry("empty group name", GVK{Domain: domain, Version: version, Kind: kind}, domain),
-			Entry("empty domain", GVK{Group: group, Version: version, Kind: kind}, group),
+			func(get func() GVK, qualifiedGroup string) {
+				Expect(get().QualifiedGroup()).To(Equal(qualifiedGroup))
+			},
+			Entry("fully qualified resource", func() GVK { return gvk }, group+"."+domain),
+			Entry("empty group name", func() GVK {
+				return GVK{Domain: domain, Version: version, Kind: kind}
+			}, domain),
+			Entry("empty domain", func() GVK {
+				return GVK{Group: group, Version: version, Kind: kind}
+			}, group),
 		)
 	})
 
@@ -81,11 +96,21 @@ var _ = Describe("GVK", func() {
 		})
 
 		DescribeTable("should return false for different resources",
-			func(other GVK) { Expect(gvk.IsEqualTo(other)).To(BeFalse()) },
-			Entry("different kind", GVK{Group: group, Domain: domain, Version: version, Kind: "Kind2"}),
-			Entry("different version", GVK{Group: group, Domain: domain, Version: "v2", Kind: kind}),
-			Entry("different domain", GVK{Group: group, Domain: "other.domain", Version: version, Kind: kind}),
-			Entry("different group", GVK{Group: "group2", Domain: domain, Version: version, Kind: kind}),
+			func(get func() GVK) {
+				Expect(gvk.IsEqualTo(get())).To(BeFalse())
+			},
+			Entry("different kind", func() GVK {
+				return GVK{Group: group, Domain: domain, Version: version, Kind: "Kind2"}
+			}),
+			Entry("different version", func() GVK {
+				return GVK{Group: group, Domain: domain, Version: "v2", Kind: kind}
+			}),
+			Entry("different domain", func() GVK {
+				return GVK{Group: group, Domain: "other.domain", Version: version, Kind: kind}
+			}),
+			Entry("different group", func() GVK {
+				return GVK{Group: "group2", Domain: domain, Version: version, Kind: kind}
+			}),
 		)
 	})
 })

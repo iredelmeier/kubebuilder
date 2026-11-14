@@ -20,7 +20,8 @@ import (
 	"fmt"
 	"strings"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/internal/validation"
+	"golang.org/x/mod/module"
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Resource contains the information required to scaffold files for a resource.
@@ -38,10 +39,29 @@ type Resource struct {
 	API *API `json:"api,omitempty"`
 
 	// Controller specifies if a controller has been scaffolded.
+	// Retained to read legacy PROJECT files and preserve compatibility with plugins.
+	//
+	// Deprecated: use Controllers.
+	// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+	// and is kept only for backwards compatibility.
 	Controller bool `json:"controller,omitempty"`
+
+	// Controllers holds named controllers for this resource.
+	Controllers *Controllers `json:"controllers,omitempty"`
 
 	// Webhooks holds the information related to the associated webhooks.
 	Webhooks *Webhooks `json:"webhooks,omitempty"`
+
+	// External specifies if the resource is defined externally.
+	External bool `json:"external,omitempty"`
+
+	// Module specifies the Go module path for external API dependencies.
+	// Can optionally include @version to pin the dependency (e.g., "github.com/org/repo@v1.2.3").
+	// This is only used when External is true.
+	Module string `json:"module,omitempty"`
+
+	// Core specifies if the resource is from Kubernetes API.
+	Core bool `json:"core,omitempty"`
 }
 
 // Validate checks that the Resource is valid.
@@ -57,7 +77,31 @@ func (r Resource) Validate() error {
 		return fmt.Errorf("invalid Plural: %#v", errors)
 	}
 
-	// TODO: validate the path
+	if r.External {
+		if r.Path == "" {
+			return fmt.Errorf("invalid Path: external resources must specify a path " +
+				"(e.g., github.com/org/repo/api/v1)")
+		}
+		if strings.Contains(r.Path, "@") {
+			return fmt.Errorf("invalid Path: version specifiers belong in the module field, not the path")
+		}
+		if err := module.CheckImportPath(r.Path); err != nil {
+			return fmt.Errorf("invalid Path: must be a valid Go import path: %w", err)
+		}
+		first, rest, _ := strings.Cut(r.Path, "/")
+		if !strings.Contains(first, ".") || strings.HasPrefix(first, ".") {
+			return fmt.Errorf("invalid Path: must be a fully-qualified Go import path " +
+				"(e.g., github.com/org/repo/api/v1)")
+		}
+		if rest == "" {
+			return fmt.Errorf("invalid Path: must include a package sub-path " +
+				"(e.g., github.com/org/repo/api/v1)")
+		}
+	} else if r.Path != "" {
+		if err := module.CheckImportPath(r.Path); err != nil {
+			return fmt.Errorf("invalid Path: %w", err)
+		}
+	}
 
 	// Validate the API
 	if r.API != nil && !r.API.IsEmpty() {
@@ -73,10 +117,108 @@ func (r Resource) Validate() error {
 		}
 	}
 
+	return r.validateControllers()
+}
+
+// validateControllers checks controller names and the Go identifiers they generate.
+func (r Resource) validateControllers() error {
+	if err := r.Controllers.Validate(); err != nil {
+		return fmt.Errorf("invalid Controllers: %w", err)
+	}
+	if err := r.validateReconcilerNames(); err != nil {
+		return fmt.Errorf("invalid Controllers: %w", err)
+	}
 	return nil
 }
 
-// PackageName returns a name valid to be used por go packages.
+// validateReconcilerNames rejects names that generate the same reconciler struct.
+func (r Resource) validateReconcilerNames() error {
+	names := r.GetControllerNames()
+	reconcilers := make(map[string]string, len(names))
+	for _, name := range names {
+		reconciler := NormalizeReconcilerName(name, r.Kind)
+		if existing, found := reconcilers[reconciler]; found {
+			return fmt.Errorf("controller name %q conflicts with %q: both generate %s",
+				name, existing, reconciler)
+		}
+		reconcilers[reconciler] = name
+	}
+
+	return nil
+}
+
+// migrations lists the steps Migrate runs, in order. Each step replaces one deprecated field.
+// To deprecate a field, add its step here.
+var migrations = []func(*Resource) error{
+	// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+	// and is kept only for backwards compatibility.
+	(*Resource).migrateControllers,
+}
+
+// Migrate replaces deprecated fields with the current resource format and validates its controllers.
+// PROJECT files are migrated when saved; legacy fields remain supported on read.
+// If any step fails, the resource is left unchanged.
+func (r *Resource) Migrate() error {
+	if r == nil {
+		return nil
+	}
+
+	migrated := r.Copy()
+	for _, migrate := range migrations {
+		if err := migrate(&migrated); err != nil {
+			return err
+		}
+	}
+	if err := migrated.validateControllers(); err != nil {
+		return err
+	}
+	*r = migrated
+
+	return nil
+}
+
+// Normalize migrates deprecated resource fields.
+// A resource that cannot be migrated is left unchanged.
+//
+// Deprecated: use Migrate, which reports failures.
+// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+// and is kept only for backwards compatibility.
+func (r *Resource) Normalize() {
+	_ = r.Migrate()
+}
+
+// migrateControllers records the deprecated Controller field as a controller named after the kind.
+//
+// Deprecated: it exists only for the Controller field.
+// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+// and is kept only for backwards compatibility.
+func (r *Resource) migrateControllers() error {
+	if !r.Controller {
+		return nil
+	}
+
+	if r.Kind == "" {
+		return fmt.Errorf("cannot migrate legacy controller: kind cannot be empty")
+	}
+
+	if r.Controllers == nil {
+		r.Controllers = &Controllers{}
+	}
+	name := DefaultControllerName(r.Kind)
+	if !r.Controllers.HasController(name) {
+		if err := r.Controllers.AddController(name); err != nil {
+			return fmt.Errorf("cannot migrate controller of kind %q: %w", r.Kind, err)
+		}
+	}
+	r.Controller = false
+	if err := r.validateControllers(); err != nil {
+		return fmt.Errorf("cannot migrate controller of kind %q: %w", r.Kind, err)
+	}
+
+	return nil
+}
+
+// PackageName returns a name valid to be used for Go packages.
 func (r Resource) PackageName() string {
 	if r.Group == "" {
 		return safeImport(r.Domain)
@@ -99,9 +241,13 @@ func (r Resource) HasAPI() bool {
 	return r.API != nil && r.API.CRDVersion != ""
 }
 
-// HasController returns true if the resource has an associated controller.
+// HasController returns true if the resource has at least one associated controller.
+// It also accepts the legacy Controller field.
 func (r Resource) HasController() bool {
-	return r.Controller
+	// Deprecated: the Controller check reads legacy PROJECT files.
+	// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+	// and is kept only for backwards compatibility.
+	return r.Controller || !r.Controllers.IsEmpty()
 }
 
 // HasDefaultingWebhook returns true if the resource has an associated defaulting webhook.
@@ -119,9 +265,30 @@ func (r Resource) HasConversionWebhook() bool {
 	return r.Webhooks != nil && r.Webhooks.Conversion
 }
 
+// IsExternal returns true if the resource was scaffold as external.
+func (r Resource) IsExternal() bool {
+	return r.External
+}
+
 // IsRegularPlural returns true if the plural is the regular plural form for the kind.
 func (r Resource) IsRegularPlural() bool {
 	return r.Plural == RegularPlural(r.Kind)
+}
+
+// GetControllerNames returns the names of all controllers for this resource.
+// Legacy controllers use the default name for their kind.
+// Returns nil if the resource has no controllers.
+func (r Resource) GetControllerNames() []string {
+	names := r.Controllers.GetControllerNames()
+
+	// Deprecated: preserve the legacy controller when both formats are present.
+	// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+	// and is kept only for backwards compatibility.
+	if name := DefaultControllerName(r.Kind); r.Controller && !r.Controllers.HasController(name) {
+		names = append(names, name)
+	}
+
+	return names
 }
 
 // Copy returns a deep copy of the Resource that can be safely modified without affecting the original.
@@ -131,6 +298,10 @@ func (r Resource) Copy() Resource {
 	if r.API != nil {
 		api := r.API.Copy()
 		r.API = &api
+	}
+	if r.Controllers != nil {
+		controllers := r.Controllers.Copy()
+		r.Controllers = &controllers
 	}
 	if r.Webhooks != nil {
 		webhooks := r.Webhooks.Copy()
@@ -143,44 +314,81 @@ func (r Resource) Copy() Resource {
 func (r *Resource) Update(other Resource) error {
 	// If self is nil, return an error
 	if r == nil {
-		return fmt.Errorf("unable to update a nil Resource")
+		return fmt.Errorf("cannot update a nil resource")
 	}
 
 	// Make sure we are not merging resources for different GVKs.
-	if !r.GVK.IsEqualTo(other.GVK) {
-		return fmt.Errorf("unable to update a Resource with another with non-matching GVK")
+	if !r.IsEqualTo(other.GVK) {
+		return fmt.Errorf("cannot update a resource (GVK %+v) with another with non-matching GVK %+v", r.GVK, other.GVK)
 	}
 
 	if r.Plural != other.Plural {
-		return fmt.Errorf("unable to update Resource with another with non-matching Plural")
+		return fmt.Errorf("cannot update resource (Plural %q) with another with non-matching Plural %q",
+			r.Plural, other.Plural)
 	}
 
-	if other.Path != "" && r.Path != other.Path {
-		if r.Path == "" {
-			r.Path = other.Path
+	// Merge into a copy so a rejected update leaves the receiver unchanged.
+	merged := r.Copy()
+
+	if other.Path != "" && merged.Path != other.Path {
+		if merged.Path == "" {
+			merged.Path = other.Path
 		} else {
-			return fmt.Errorf("unable to update Resource with another with non-matching Path")
+			return fmt.Errorf("cannot update resource (Path %q) with another with non-matching Path %q", r.Path, other.Path)
 		}
 	}
 
 	// Update API.
-	if r.API == nil && other.API != nil {
-		r.API = &API{}
+	if merged.API == nil && other.API != nil {
+		merged.API = &API{}
 	}
-	if err := r.API.Update(other.API); err != nil {
+	if err := merged.API.Update(other.API); err != nil {
 		return err
 	}
 
-	// Update controller.
-	r.Controller = r.Controller || other.Controller
+	if err := merged.updateControllers(other); err != nil {
+		return err
+	}
 
 	// Update Webhooks.
-	if r.Webhooks == nil && other.Webhooks != nil {
-		r.Webhooks = &Webhooks{}
+	if merged.Webhooks == nil && other.Webhooks != nil {
+		merged.Webhooks = &Webhooks{}
 	}
-	if err := r.Webhooks.Update(other.Webhooks); err != nil {
+	if err := merged.Webhooks.Update(other.Webhooks); err != nil {
 		return err
 	}
+
+	*r = merged
+	return nil
+}
+
+// updateControllers migrates and merges controllers, then validates the result.
+func (r *Resource) updateControllers(other Resource) error {
+	// Validate the merged copy before changing the original resource.
+	merged := r.Copy()
+	if err := merged.Migrate(); err != nil {
+		return err
+	}
+	incoming := other.Copy()
+	if err := incoming.Migrate(); err != nil {
+		return err
+	}
+	if !incoming.Controllers.IsEmpty() {
+		if merged.Controllers == nil {
+			merged.Controllers = &Controllers{}
+		}
+		if err := merged.Controllers.Update(incoming.Controllers); err != nil {
+			return err
+		}
+	}
+	if err := merged.validateControllers(); err != nil {
+		return fmt.Errorf("cannot update controllers of kind %q: %w", r.Kind, err)
+	}
+	// Deprecated: the Controller field is kept until it is removed.
+	// TODO: remove when Kubebuilder 5.x is released. This should no longer be part of 5.x
+	// and is kept only for backwards compatibility.
+	r.Controller = merged.Controller
+	r.Controllers = merged.Controllers
 
 	return nil
 }
@@ -191,7 +399,7 @@ func wrapKey(key string) string {
 
 // Replacer returns a strings.Replacer that replaces resource keywords with values.
 func (r Resource) Replacer() *strings.Replacer {
-	var replacements []string
+	replacements := make([]string, 0, 10)
 
 	replacements = append(replacements, wrapKey("group"), r.Group)
 	replacements = append(replacements, wrapKey("version"), r.Version)

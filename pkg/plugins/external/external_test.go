@@ -1,0 +1,1408 @@
+/*
+Copyright 2022 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package external
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"testing"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/spf13/afero"
+	"github.com/spf13/pflag"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	v3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin/external"
+)
+
+type chainAwareSubcommand interface {
+	SetPluginChain([]string)
+	InjectConfig(config.Config) error
+}
+
+var pluginChainTestCases = []struct {
+	name string
+	new  func() chainAwareSubcommand
+	get  func(chainAwareSubcommand) []string
+}{
+	{
+		name: "init",
+		new:  func() chainAwareSubcommand { return &initSubcommand{} },
+		get:  func(sub chainAwareSubcommand) []string { return sub.(*initSubcommand).pluginChain },
+	},
+	{
+		name: "edit",
+		new:  func() chainAwareSubcommand { return &editSubcommand{} },
+		get:  func(sub chainAwareSubcommand) []string { return sub.(*editSubcommand).pluginChain },
+	},
+	{
+		name: "create api",
+		new:  func() chainAwareSubcommand { return &createAPISubcommand{} },
+		get:  func(sub chainAwareSubcommand) []string { return sub.(*createAPISubcommand).pluginChain },
+	},
+	{
+		name: "create webhook",
+		new:  func() chainAwareSubcommand { return &createWebhookSubcommand{} },
+		get:  func(sub chainAwareSubcommand) []string { return sub.(*createWebhookSubcommand).pluginChain },
+	},
+}
+
+func TestExternalPlugin(t *testing.T) {
+	RegisterFailHandler(Fail)
+	RunSpecs(t, "Scaffold")
+}
+
+type mockValidOutputGetter struct{}
+
+type mockInValidOutputGetter struct{}
+
+var _ ExecOutputGetter = &mockValidOutputGetter{}
+
+func (m *mockValidOutputGetter) GetExecOutput(_ []byte, _ string) ([]byte, error) {
+	return []byte(`{
+		"command": "init", 
+		"error": false, 
+		"error_msg": "none", 
+		"universe": {"LICENSE": "Apache 2.0 License\n"}
+		}`), nil
+}
+
+var _ ExecOutputGetter = &mockInValidOutputGetter{}
+
+func (m *mockInValidOutputGetter) GetExecOutput(_ []byte, _ string) ([]byte, error) {
+	return nil, fmt.Errorf("error getting exec command output")
+}
+
+type mockPluginChainCaptureGetter struct {
+	capturedChain *[]string
+}
+
+var _ ExecOutputGetter = &mockPluginChainCaptureGetter{}
+
+func (m *mockPluginChainCaptureGetter) GetExecOutput(request []byte, _ string) ([]byte, error) {
+	// Parse the request to capture the plugin chain
+	var req external.PluginRequest
+	if err := json.Unmarshal(request, &req); err != nil {
+		return nil, fmt.Errorf("error unmarshalling request: %w", err)
+	}
+
+	// Capture the plugin chain
+	*m.capturedChain = req.PluginChain
+
+	// Return a valid response
+	return []byte(`{
+		"command": "init",
+		"error": false,
+		"error_msg": "none",
+		"universe": {"LICENSE": "Apache 2.0 License\n"}
+	}`), nil
+}
+
+type mockValidOsWdGetter struct{}
+
+var _ OsWdGetter = &mockValidOsWdGetter{}
+
+func (m *mockValidOsWdGetter) GetCurrentDir() (string, error) {
+	return "tmp/externalPlugin", nil
+}
+
+type mockInValidOsWdGetter struct{}
+
+var _ OsWdGetter = &mockInValidOsWdGetter{}
+
+func (m *mockInValidOsWdGetter) GetCurrentDir() (string, error) {
+	return "", fmt.Errorf("error getting current directory")
+}
+
+type mockConfigOutputGetter struct {
+	capturedRequest *external.PluginRequest
+}
+
+var _ ExecOutputGetter = &mockConfigOutputGetter{}
+
+func (m *mockConfigOutputGetter) GetExecOutput(reqBytes []byte, _ string) ([]byte, error) {
+	m.capturedRequest = &external.PluginRequest{}
+	if err := json.Unmarshal(reqBytes, m.capturedRequest); err != nil {
+		return nil, fmt.Errorf("error unmarshalling request: %w", err)
+	}
+
+	return []byte(`{
+		"command": "init", 
+		"error": false, 
+		"error_msg": "none", 
+		"universe": {"LICENSE": "Apache 2.0 License\n"}
+		}`), nil
+}
+
+type mockValidFlagOutputGetter struct{}
+
+func (m *mockValidFlagOutputGetter) GetExecOutput(_ []byte, _ string) ([]byte, error) {
+	response := external.PluginResponse{
+		Command:  "flag",
+		Error:    false,
+		Universe: nil,
+		Flags:    getFlags(),
+	}
+	marshaledResponse, err := json.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling response: %w", err)
+	}
+
+	return marshaledResponse, nil
+}
+
+type mockValidMEOutputGetter struct{}
+
+func (m *mockValidMEOutputGetter) GetExecOutput(_ []byte, _ string) ([]byte, error) {
+	response := external.PluginResponse{
+		Command:  "metadata",
+		Error:    false,
+		Universe: nil,
+		Metadata: getMetadata(),
+	}
+
+	marshaledResponse, err := json.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("error marshalling response: %w", err)
+	}
+
+	return marshaledResponse, nil
+}
+
+const (
+	argDomain               = "--domain"
+	pluginScriptPath        = "test.sh"
+	universeFileName        = "file"
+	pluginGoKubebuilderV4   = "go.kubebuilder.io/v4"
+	pluginGoKubebuilderV3   = "go.kubebuilder.io/v3"
+	pluginDeclarativeGoV1   = "declarative.go.kubebuilder.io/v1"
+	pluginKustomizeCommonV2 = "kustomize.common.kubebuilder.io/v2"
+	pluginCLI               = "cli.plugin/v1"
+	kindMyKind              = "MyKind"
+	exampleDomain           = "example.com"
+	apiGroupApps            = "apps"
+)
+
+var _ = Describe("Run external plugin using Scaffold", func() {
+	const externalPlugin = "myexternalplugin.sh"
+
+	Context("with valid mock values", func() {
+		const filePerm os.FileMode = 755
+		var (
+			pluginFileName string
+			args           []string
+			f              afero.File
+			fs             machinery.Filesystem
+
+			err error
+		)
+
+		BeforeEach(func() {
+			outputGetter = &mockValidOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+			fs = machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			pluginFileName = "externalPlugin.sh"
+			pluginFilePath := filepath.Join("tmp", "externalPlugin", pluginFileName)
+
+			err = fs.FS.MkdirAll(filepath.Dir(pluginFilePath), filePerm)
+			Expect(err).ToNot(HaveOccurred())
+
+			f, err = fs.FS.Create(pluginFilePath)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(f).ToNot(BeNil())
+
+			_, err = fs.FS.Stat(pluginFilePath)
+			Expect(err).ToNot(HaveOccurred())
+
+			args = []string{argDomain, exampleDomain}
+		})
+
+		AfterEach(func() {
+			filename := filepath.Join("tmp", "externalPlugin", "LICENSE")
+			var fileInfo os.FileInfo
+			fileInfo, err = fs.FS.Stat(filename)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(fileInfo).NotTo(BeNil())
+		})
+
+		It("should successfully run init subcommand on the external plugin", func() {
+			i := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = i.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should successfully run edit subcommand on the external plugin", func() {
+			e := editSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = e.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should successfully run create api subcommand on the external plugin", func() {
+			c := createAPISubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("should successfully run create webhook subcommand on the external plugin", func() {
+			c := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+		})
+	})
+
+	Context("with invalid mock values of GetExecOutput() and GetCurrentDir()", func() {
+		var (
+			pluginFileName string
+			args           []string
+			fs             machinery.Filesystem
+			err            error
+		)
+		BeforeEach(func() {
+			outputGetter = &mockInValidOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+			fs = machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			pluginFileName = externalPlugin
+			args = []string{argDomain, exampleDomain}
+		})
+
+		It("should return error upon running init subcommand on the external plugin", func() {
+			i := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = i.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting exec command output"))
+
+			outputGetter = &mockValidOutputGetter{}
+			currentDirGetter = &mockInValidOsWdGetter{}
+
+			err = i.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting current directory"))
+		})
+
+		It("should return error upon running edit subcommand on the external plugin", func() {
+			e := editSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = e.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting exec command output"))
+
+			outputGetter = &mockValidOutputGetter{}
+			currentDirGetter = &mockInValidOsWdGetter{}
+
+			err = e.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting current directory"))
+		})
+
+		It("should return error upon running create api subcommand on the external plugin", func() {
+			c := createAPISubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = c.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting exec command output"))
+
+			outputGetter = &mockValidOutputGetter{}
+			currentDirGetter = &mockInValidOsWdGetter{}
+
+			err = c.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting current directory"))
+		})
+
+		It("should return error upon running create webhook subcommand on the external plugin", func() {
+			c := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			err = c.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting exec command output"))
+
+			outputGetter = &mockValidOutputGetter{}
+			currentDirGetter = &mockInValidOsWdGetter{}
+
+			err = c.Scaffold(fs)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("error getting current directory"))
+		})
+	})
+
+	Context("with successfully getting flags from external plugin", func() {
+		var (
+			pluginFileName string
+			args           []string
+			flagset        *pflag.FlagSet
+
+			// Make an array of flags to represent the ones that should be returned in these tests
+			flags []external.Flag
+
+			checkFlagset func()
+		)
+
+		BeforeEach(func() {
+			outputGetter = &mockValidFlagOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+
+			pluginFileName = externalPlugin
+			args = []string{"--captain", "black-beard", "--sail"}
+			flagset = pflag.NewFlagSet("test", pflag.ContinueOnError)
+
+			flags = getFlags()
+
+			checkFlagset = func() {
+				Expect(flagset.HasFlags()).To(BeTrue())
+
+				for _, flag := range flags {
+					Expect(flagset.Lookup(flag.Name)).NotTo(BeNil())
+					// we parse floats as float64 Go type so this check will account for that
+					if flag.Type != flagTypeFloat {
+						Expect(flagset.Lookup(flag.Name).Value.Type()).To(Equal(flag.Type))
+					} else {
+						Expect(flagset.Lookup(flag.Name).Value.Type()).To(Equal("float64"))
+					}
+					Expect(flagset.Lookup(flag.Name).Usage).To(Equal(flag.Usage))
+					Expect(flagset.Lookup(flag.Name).DefValue).To(Equal(flag.Default))
+				}
+			}
+		})
+
+		It("should successfully bind external plugin specified flags for `init` subcommand", func() {
+			sc := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind external plugin specified flags for `create api` subcommand", func() {
+			sc := createAPISubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind external plugin specified  flags for `create webhook` subcommand", func() {
+			sc := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind external plugin specified flags for `edit` subcommand", func() {
+			sc := editSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+	})
+
+	Context("with failure to get flags from external plugin", func() {
+		var (
+			pluginFileName string
+			args           []string
+			flagset        *pflag.FlagSet
+			usage          string
+			checkFlagset   func()
+		)
+
+		BeforeEach(func() {
+			outputGetter = &mockInValidOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+
+			pluginFileName = externalPlugin
+			args = []string{"--captain", "black-beard", "--sail"}
+			flagset = pflag.NewFlagSet("test", pflag.ContinueOnError)
+			usage = "Kubebuilder could not validate this flag with the external plugin. " +
+				"Consult the external plugin documentation for more information."
+
+			checkFlagset = func() {
+				Expect(flagset.HasFlags()).To(BeTrue())
+
+				Expect(flagset.Lookup("captain")).NotTo(BeNil())
+				Expect(flagset.Lookup("captain").Value.Type()).To(Equal("string"))
+				Expect(flagset.Lookup("captain").Usage).To(Equal(usage))
+
+				Expect(flagset.Lookup("sail")).NotTo(BeNil())
+				Expect(flagset.Lookup("sail").Value.Type()).To(Equal("bool"))
+				Expect(flagset.Lookup("sail").Usage).To(Equal(usage))
+			}
+		})
+
+		It("should successfully bind all user passed flags for `init` subcommand", func() {
+			sc := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind all user passed flags for `create api` subcommand", func() {
+			sc := createAPISubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind all user passed flags for `create webhook` subcommand", func() {
+			sc := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+
+		It("should successfully bind all user passed flags for `edit` subcommand", func() {
+			sc := editSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			sc.BindFlags(flagset)
+
+			checkFlagset()
+		})
+	})
+
+	Context("Flag Parsing Filter Functions", func() {
+		It("gvk(Arg/Flag)Filter should filter out (--)group, (--)version, (--)kind", func() {
+			for _, toBeFiltered := range []string{
+				flagNameGroup, flagNameVersion, flagNameKind,
+			} {
+				Expect(gvkArgFilter("--" + toBeFiltered)).To(BeFalse())
+				Expect(gvkArgFilter(toBeFiltered)).To(BeFalse())
+				Expect(gvkFlagFilter(external.Flag{Name: "--" + toBeFiltered})).To(BeFalse())
+				Expect(gvkFlagFilter(external.Flag{Name: "--" + toBeFiltered})).To(BeFalse())
+			}
+			Expect(gvkArgFilter("somerandomflag")).To(BeTrue())
+			Expect(gvkFlagFilter(external.Flag{Name: "somerandomflag"})).To(BeTrue())
+		})
+
+		It("helpArgFilter should filter out (--)help", func() {
+			Expect(helpArgFilter(argHelp)).To(BeFalse())
+			Expect(helpArgFilter(flagNameHelp)).To(BeFalse())
+			Expect(helpArgFilter("somerandomflag")).To(BeTrue())
+			Expect(helpFlagFilter(external.Flag{Name: argHelp})).To(BeFalse())
+			Expect(helpFlagFilter(external.Flag{Name: flagNameHelp})).To(BeFalse())
+			Expect(helpFlagFilter(external.Flag{Name: "somerandomflag"})).To(BeTrue())
+		})
+	})
+
+	Context("Flag Parsing Helper Functions", func() {
+		var (
+			fs                  *pflag.FlagSet
+			args                []string
+			forbidden           []string
+			flags               []external.Flag
+			argFilters          []argFilterFunc
+			externalFlagFilters []externalFlagFilterFunc
+		)
+
+		BeforeEach(func() {
+			args = []string{
+				argDomain, "something.com",
+				"--boolean",
+				"--another", "flag",
+				argHelp,
+				argGroup, "somegroup",
+				argKind, "somekind",
+				argVersion, "someversion",
+			}
+			forbidden = []string{
+				flagNameHelp, flagNameGroup, flagNameKind, flagNameVersion,
+			}
+
+			fs = pflag.NewFlagSet("test", pflag.ContinueOnError)
+
+			flagsToAppend := getFlags()
+
+			flags = make([]external.Flag, len(flagsToAppend))
+			copy(flags, flagsToAppend)
+
+			argFilters = []argFilterFunc{
+				gvkArgFilter, helpArgFilter,
+			}
+			externalFlagFilters = []externalFlagFilterFunc{
+				gvkFlagFilter, helpFlagFilter,
+			}
+		})
+
+		It("isBooleanFlag should return true if boolean flag provided at index", func() {
+			Expect(isBooleanFlag(2, args)).To(BeTrue())
+		})
+
+		It("isBooleanFlag should return false if boolean flag not provided at index", func() {
+			Expect(isBooleanFlag(0, args)).To(BeFalse())
+		})
+
+		It("bindAllFlags should bind all flags", func() {
+			usage := "Kubebuilder could not validate this flag with the external plugin. " +
+				"Consult the external plugin documentation for more information."
+
+			bindAllFlags(fs, filterArgs(args, argFilters))
+			Expect(fs.HasFlags()).To(BeTrue())
+			Expect(fs.Lookup("domain")).NotTo(BeNil())
+			Expect(fs.Lookup("domain").Value.Type()).To(Equal("string"))
+			Expect(fs.Lookup("domain").Usage).To(Equal(usage))
+			Expect(fs.Lookup("boolean")).NotTo(BeNil())
+			Expect(fs.Lookup("boolean").Value.Type()).To(Equal("bool"))
+			Expect(fs.Lookup("boolean").Usage).To(Equal(usage))
+			Expect(fs.Lookup("another")).NotTo(BeNil())
+			Expect(fs.Lookup("another").Value.Type()).To(Equal("string"))
+			Expect(fs.Lookup("another").Usage).To(Equal(usage))
+
+			By("bindAllFlags not have bound any forbidden flag after filtering")
+			for i := range forbidden {
+				Expect(fs.Lookup(forbidden[i])).To(BeNil())
+			}
+		})
+
+		It("bindSpecificFlags should bind all flags in given []Flag", func() {
+			filteredFlags := filterFlags(flags, externalFlagFilters)
+			bindSpecificFlags(fs, filteredFlags)
+
+			Expect(fs.HasFlags()).To(BeTrue())
+
+			for _, flag := range filteredFlags {
+				Expect(fs.Lookup(flag.Name)).NotTo(BeNil())
+				// we parse floats as float64 Go type so this check will account for that
+				if flag.Type != flagTypeFloat {
+					Expect(fs.Lookup(flag.Name).Value.Type()).To(Equal(flag.Type))
+				} else {
+					Expect(fs.Lookup(flag.Name).Value.Type()).To(Equal("float64"))
+				}
+				Expect(fs.Lookup(flag.Name).Usage).To(Equal(flag.Usage))
+				Expect(fs.Lookup(flag.Name).DefValue).To(Equal(flag.Default))
+			}
+
+			By("bindSpecificFlags not have bound any forbidden flag after filtering")
+			for i := range forbidden {
+				Expect(fs.Lookup(forbidden[i])).To(BeNil())
+			}
+		})
+	})
+
+	Context("Successfully retrieving metadata and examples from external plugin", func() {
+		var (
+			pluginFileName string
+			metadata       *plugin.SubcommandMetadata
+			checkMetadata  func()
+		)
+
+		BeforeEach(func() {
+			outputGetter = &mockValidMEOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+
+			pluginFileName = externalPlugin
+			metadata = &plugin.SubcommandMetadata{}
+
+			checkMetadata = func() {
+				Expect(metadata.Description).Should(Equal(getMetadata().Description))
+				Expect(metadata.Examples).Should(Equal(getMetadata().Examples))
+			}
+		})
+
+		It("should use the external plugin's metadata and examples for `init` subcommand", func() {
+			sc := initSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the external plugin's metadata and examples for `create api` subcommand", func() {
+			sc := createAPISubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the external plugin's metadata and examples for `create webhook` subcommand", func() {
+			sc := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the external plugin's metadata and examples for `edit` subcommand", func() {
+			sc := editSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+	})
+
+	Context("Failing to retrieve metadata and examples from external plugin", func() {
+		var (
+			pluginFileName string
+			metadata       *plugin.SubcommandMetadata
+			checkMetadata  func()
+		)
+
+		BeforeEach(func() {
+			outputGetter = &mockInValidOutputGetter{}
+			currentDirGetter = &mockValidOsWdGetter{}
+
+			pluginFileName = externalPlugin
+			metadata = &plugin.SubcommandMetadata{}
+
+			checkMetadata = func() {
+				Expect(metadata.Description).Should(Equal(fmt.Sprintf(defaultMetadataTemplate, "myexternalplugin")))
+				Expect(metadata.Examples).Should(BeEmpty())
+			}
+		})
+
+		It("should use the default metadata and examples for `init` subcommand", func() {
+			sc := initSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the default metadata and examples for `create api` subcommand", func() {
+			sc := createAPISubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the default metadata and examples for `create webhook` subcommand", func() {
+			sc := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+
+		It("should use the default metadata and examples for `edit` subcommand", func() {
+			sc := editSubcommand{
+				Path: pluginFileName,
+				Args: nil,
+			}
+
+			sc.UpdateMetadata(plugin.CLIMetadata{}, metadata)
+
+			checkMetadata()
+		})
+	})
+
+	Context("Helper functions for Sending request to external plugin and parsing response", func() {
+		It("getUniverseMap should return path to content mapping of all files in Filesystem", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			files := []struct {
+				path    string
+				name    string
+				content string
+			}{
+				{
+					path:    "./",
+					name:    universeFileName,
+					content: "level 0 file",
+				},
+				{
+					path:    "dir/",
+					name:    universeFileName,
+					content: "level 1 file",
+				},
+				{
+					path:    "dir/subdir",
+					name:    universeFileName,
+					content: "level 2 file",
+				},
+			}
+
+			// create files in Filesystem
+			for _, file := range files {
+				err := fs.FS.MkdirAll(file.path, 0o700)
+				Expect(err).ToNot(HaveOccurred())
+
+				f, err := fs.FS.Create(filepath.Join(file.path, file.name))
+				Expect(err).ToNot(HaveOccurred())
+
+				_, err = f.Write([]byte(file.content))
+				Expect(err).ToNot(HaveOccurred())
+
+				err = f.Close()
+				Expect(err).ToNot(HaveOccurred())
+			}
+
+			universe, err := getUniverseMap(fs)
+
+			Expect(err).ToNot(HaveOccurred())
+			Expect(universe).To(HaveLen(len(files)))
+
+			for _, file := range files {
+				content := universe[filepath.Join(file.path, file.name)]
+				Expect(content).To(Equal(file.content))
+			}
+		})
+	})
+
+	Context("plugin chain propagation", func() {
+		for _, tc := range pluginChainTestCases {
+			caseData := tc
+			Context(caseData.name, func() {
+				It("keeps the CLI-provided chain when config omits pluginChain", func() {
+					sub := caseData.new()
+
+					cliChain := []string{pluginCLI}
+					sub.SetPluginChain(cliChain)
+
+					cliChain[0] = "mutated"
+					Expect(caseData.get(sub)).To(Equal([]string{pluginCLI}))
+
+					cfg := v3.New()
+					Expect(sub.InjectConfig(cfg)).To(Succeed())
+					Expect(caseData.get(sub)).To(Equal([]string{pluginCLI}))
+
+					sub.SetPluginChain(nil)
+					Expect(caseData.get(sub)).To(BeNil())
+				})
+
+				It("prefers the config plugin chain when present", func() {
+					sub := caseData.new()
+					sub.SetPluginChain([]string{pluginCLI})
+
+					cfg := v3.New()
+					expected := []string{"config.plugin/v2"}
+					Expect(cfg.SetPluginChain(expected)).To(Succeed())
+
+					Expect(sub.InjectConfig(cfg)).To(Succeed())
+					Expect(caseData.get(sub)).To(Equal(expected))
+				})
+			})
+		}
+	})
+
+	Context("PluginChain is passed to external plugin", func() {
+		var (
+			pluginChainCaptured []string
+			mockOutputGetter    *mockPluginChainCaptureGetter
+		)
+
+		BeforeEach(func() {
+			mockOutputGetter = &mockPluginChainCaptureGetter{
+				capturedChain: &pluginChainCaptured,
+			}
+			outputGetter = mockOutputGetter
+			currentDirGetter = &mockValidOsWdGetter{}
+		})
+
+		It("should pass plugin chain to init subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			i := initSubcommand{
+				Path:        pluginScriptPath,
+				Args:        []string{argDomain, exampleDomain},
+				pluginChain: []string{pluginGoKubebuilderV4, pluginKustomizeCommonV2},
+			}
+
+			err := i.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4, pluginKustomizeCommonV2}))
+		})
+
+		It("should pass plugin chain to create api subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			c := createAPISubcommand{
+				Path:        pluginScriptPath,
+				Args:        []string{argGroup, apiGroupApps, argVersion, "v1", argKind, kindMyKind},
+				pluginChain: []string{pluginGoKubebuilderV4},
+			}
+
+			err := c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4}))
+		})
+
+		It("should pass plugin chain to create webhook subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			w := createWebhookSubcommand{
+				Path:        pluginScriptPath,
+				Args:        []string{argGroup, apiGroupApps, argVersion, "v1", argKind, kindMyKind},
+				pluginChain: []string{pluginGoKubebuilderV3},
+			}
+
+			err := w.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV3}))
+		})
+
+		It("should pass plugin chain to edit subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			e := editSubcommand{
+				Path:        pluginScriptPath,
+				Args:        []string{"--multigroup"},
+				pluginChain: []string{pluginGoKubebuilderV4, pluginDeclarativeGoV1},
+			}
+
+			err := e.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4, pluginDeclarativeGoV1}))
+		})
+	})
+
+	Context("with config injection", func() {
+		const (
+			filePerm          os.FileMode = 755
+			captainKind                   = "Captain"
+			captainController             = "captain"
+			backupController              = "captain-backup"
+		)
+		var (
+			pluginFileName string
+			args           []string
+			f              afero.File
+			fs             machinery.Filesystem
+			mockGetter     *mockConfigOutputGetter
+			cfg            *v3.Cfg
+			expectedChain  []string
+
+			err error
+		)
+
+		BeforeEach(func() {
+			mockGetter = &mockConfigOutputGetter{}
+			outputGetter = mockGetter
+			currentDirGetter = &mockValidOsWdGetter{}
+			fs = machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			pluginFileName = "externalPlugin.sh"
+			pluginFilePath := filepath.Join("tmp", "externalPlugin", pluginFileName)
+
+			err = fs.FS.MkdirAll(filepath.Dir(pluginFilePath), filePerm)
+			Expect(err).ToNot(HaveOccurred())
+
+			f, err = fs.FS.Create(pluginFilePath)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(f).ToNot(BeNil())
+
+			_, err = fs.FS.Stat(pluginFilePath)
+			Expect(err).ToNot(HaveOccurred())
+
+			args = []string{argDomain, exampleDomain}
+
+			cfg = &v3.Cfg{
+				Version:    v3.Version,
+				Domain:     "test.domain",
+				Repository: "github.com/test/repo",
+				Name:       "test-project",
+			}
+
+			expectedChain = []string{pluginGoKubebuilderV4, pluginKustomizeCommonV2}
+			Expect(cfg.SetPluginChain(expectedChain)).To(Succeed())
+		})
+
+		It("should pass config to external plugin on init subcommand", func() {
+			i := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			Expect(i.InjectConfig(cfg)).To(Succeed())
+
+			err = i.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockGetter.capturedRequest).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config["domain"]).To(Equal("test.domain"))
+			Expect(mockGetter.capturedRequest.Config["repo"]).To(Equal("github.com/test/repo"))
+			Expect(mockGetter.capturedRequest.Config["projectName"]).To(Equal("test-project"))
+			Expect(mockGetter.capturedRequest.PluginChain).To(Equal(expectedChain))
+		})
+
+		It("should pass config to external plugin on create api subcommand", func() {
+			c := createAPISubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			Expect(c.InjectConfig(cfg)).To(Succeed())
+
+			err = c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockGetter.capturedRequest).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config["domain"]).To(Equal("test.domain"))
+			Expect(mockGetter.capturedRequest.PluginChain).To(Equal(expectedChain))
+		})
+
+		It("should send a legacy controller as the controllers list in both the config and the PROJECT file",
+			func() {
+				cfg.Resources = []resource.Resource{{
+					GVK:        resource.GVK{Version: "v1", Kind: captainKind},
+					Controller: true,
+				}}
+				const legacyProject = `domain: test.domain
+resources:
+- controller: true
+  kind: Captain
+  version: v1
+version: "3"
+`
+				Expect(afero.WriteFile(fs.FS, "PROJECT", []byte(legacyProject), filePerm)).To(Succeed())
+				c := createAPISubcommand{Path: pluginFileName, Args: args}
+				Expect(c.InjectConfig(cfg)).To(Succeed())
+
+				Expect(c.Scaffold(fs)).To(Succeed())
+
+				resources, ok := mockGetter.capturedRequest.Config["resources"].([]any)
+				Expect(ok).To(BeTrue())
+				Expect(resources).To(ConsistOf(SatisfyAll(
+					HaveKeyWithValue("controllers", ConsistOf(HaveKeyWithValue("name", "captain"))),
+					Not(HaveKey("controller")),
+				)))
+				saved, marshalErr := cfg.MarshalYAML()
+				Expect(marshalErr).NotTo(HaveOccurred())
+				Expect(mockGetter.capturedRequest.Universe).To(HaveKeyWithValue("PROJECT", string(saved)))
+				sent := v3.New()
+				Expect(sent.UnmarshalYAML([]byte(mockGetter.capturedRequest.Universe["PROJECT"]))).To(Succeed())
+				captain, getErr := sent.GetResource(resource.GVK{Version: "v1", Kind: captainKind})
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(captain.Controller).To(BeFalse()) //nolint:staticcheck // checking the migrated field
+				Expect(captain.GetControllerNames()).To(Equal([]string{"captain"}))
+			})
+
+		It("should pass config to external plugin on create webhook subcommand", func() {
+			c := createWebhookSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			Expect(c.InjectConfig(cfg)).To(Succeed())
+
+			err = c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockGetter.capturedRequest).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config["domain"]).To(Equal("test.domain"))
+			Expect(mockGetter.capturedRequest.PluginChain).To(Equal(expectedChain))
+		})
+
+		It("should pass config to external plugin on edit subcommand", func() {
+			e := editSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			Expect(e.InjectConfig(cfg)).To(Succeed())
+
+			err = e.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockGetter.capturedRequest).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config["domain"]).To(Equal("test.domain"))
+			Expect(mockGetter.capturedRequest.PluginChain).To(Equal(expectedChain))
+		})
+
+		DescribeTable("should preserve controller information in external plugin requests",
+			func(legacy bool, names, expected []string) {
+				res := resource.Resource{
+					GVK: resource.GVK{Group: "crew", Version: "v1", Kind: captainKind},
+				}
+				res.Controller = legacy //nolint:staticcheck // legacy external plugin compatibility
+				for _, name := range names {
+					if res.Controllers == nil {
+						res.Controllers = &resource.Controllers{}
+					}
+					Expect(res.Controllers.AddController(name)).To(Succeed())
+				}
+				Expect(cfg.AddResource(res)).To(Succeed())
+				pluginData := map[string]any{"custom": map[string]any{"enabled": true}}
+				Expect(cfg.EncodePluginConfig("consumer.example/v1", pluginData)).To(Succeed())
+				before := cfg.Resources[0].Copy()
+				c := createAPISubcommand{Path: pluginFileName, Args: args}
+				Expect(c.InjectConfig(cfg)).To(Succeed())
+				Expect(c.Scaffold(fs)).To(Succeed())
+
+				rawResources, ok := mockGetter.capturedRequest.Config["resources"].([]any)
+				Expect(ok).To(BeTrue())
+				Expect(rawResources).To(HaveLen(1))
+				rawResource, ok := rawResources[0].(map[string]any)
+				Expect(ok).To(BeTrue())
+				Expect(rawResource).NotTo(HaveKey("controller"))
+				var rawNames []string
+				if rawControllers, found := rawResource["controllers"].([]any); found {
+					for _, entry := range rawControllers {
+						rawEntry, isMap := entry.(map[string]any)
+						Expect(isMap).To(BeTrue())
+						rawNames = append(rawNames, fmt.Sprint(rawEntry["name"]))
+					}
+				}
+				Expect(rawNames).To(Equal(expected))
+
+				encoded, marshalErr := json.Marshal(mockGetter.capturedRequest.Config)
+				Expect(marshalErr).NotTo(HaveOccurred())
+				received := v3.New()
+				Expect(received.UnmarshalYAML(encoded)).To(Succeed())
+				actual, getErr := received.GetResource(res.GVK)
+				Expect(getErr).NotTo(HaveOccurred())
+				Expect(actual.GetControllerNames()).To(Equal(expected))
+				Expect(actual.HasController()).To(Equal(len(expected) > 0))
+				Expect(actual.Validate()).To(Succeed())
+				var receivedPluginData map[string]any
+				Expect(received.DecodePluginConfig("consumer.example/v1", &receivedPluginData)).To(Succeed())
+				Expect(receivedPluginData).To(Equal(pluginData))
+				Expect(cfg.Resources[0]).To(Equal(before))
+			},
+			Entry("legacy", true, nil, []string{captainController}),
+			Entry("named", false, []string{captainController, backupController}, []string{captainController, backupController}),
+			Entry("mixed", true, []string{backupController}, []string{backupController, captainController}),
+			Entry("no controller", false, nil, nil),
+		)
+
+		It("should reject invalid migration before invoking an external plugin", func() {
+			res := resource.Resource{
+				GVK:         resource.GVK{Group: "crew", Version: "v1", Kind: "MyKind"},
+				Controllers: &resource.Controllers{{Name: "my-kind"}},
+			}
+			res.Controller = true //nolint:staticcheck // legacy external plugin compatibility
+			Expect(cfg.AddResource(res)).To(Succeed())
+			c := createAPISubcommand{Path: pluginFileName, Args: args}
+			Expect(c.InjectConfig(cfg)).To(Succeed())
+			Expect(c.Scaffold(fs)).To(MatchError(ContainSubstring("both generate MyKindReconciler")))
+			Expect(mockGetter.capturedRequest).To(BeNil())
+			Expect(cfg.Resources[0].GetControllerNames()).To(Equal([]string{"my-kind", "mykind"}))
+		})
+
+		It("should handle nil config gracefully", func() {
+			i := initSubcommand{
+				Path: pluginFileName,
+				Args: args,
+			}
+
+			Expect(i.InjectConfig(nil)).To(Succeed())
+
+			err = i.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+
+			Expect(mockGetter.capturedRequest).ToNot(BeNil())
+			Expect(mockGetter.capturedRequest.Config).To(BeNil())
+			Expect(mockGetter.capturedRequest.PluginChain).To(BeNil())
+		})
+	})
+
+	Context("PluginChain is passed to external plugin", func() {
+		var (
+			pluginChainCaptured []string
+			mockOutputGetter    *mockPluginChainCaptureGetter
+		)
+
+		BeforeEach(func() {
+			pluginChainCaptured = nil
+			mockOutputGetter = &mockPluginChainCaptureGetter{
+				capturedChain: &pluginChainCaptured,
+			}
+			outputGetter = mockOutputGetter
+			currentDirGetter = &mockValidOsWdGetter{}
+		})
+
+		It("should pass plugin chain to init subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			cfg := &v3.Cfg{Version: v3.Version}
+			Expect(cfg.SetPluginChain([]string{pluginGoKubebuilderV4, pluginKustomizeCommonV2})).To(Succeed())
+
+			i := initSubcommand{
+				Path: pluginScriptPath,
+				Args: []string{argDomain, exampleDomain},
+			}
+
+			Expect(i.InjectConfig(cfg)).To(Succeed())
+
+			err := i.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4, pluginKustomizeCommonV2}))
+		})
+
+		It("should pass plugin chain to create api subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			cfg := &v3.Cfg{Version: v3.Version}
+			Expect(cfg.SetPluginChain([]string{pluginGoKubebuilderV4})).To(Succeed())
+
+			c := createAPISubcommand{
+				Path: pluginScriptPath,
+				Args: []string{argGroup, apiGroupApps, argVersion, "v1", argKind, kindMyKind},
+			}
+
+			Expect(c.InjectConfig(cfg)).To(Succeed())
+
+			err := c.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4}))
+		})
+
+		It("should pass plugin chain to create webhook subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			cfg := &v3.Cfg{Version: v3.Version}
+			Expect(cfg.SetPluginChain([]string{pluginGoKubebuilderV3})).To(Succeed())
+
+			w := createWebhookSubcommand{
+				Path: pluginScriptPath,
+				Args: []string{argGroup, apiGroupApps, argVersion, "v1", argKind, kindMyKind},
+			}
+
+			Expect(w.InjectConfig(cfg)).To(Succeed())
+
+			err := w.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV3}))
+		})
+
+		It("should pass plugin chain to edit subcommand", func() {
+			fs := machinery.Filesystem{
+				FS: afero.NewMemMapFs(),
+			}
+
+			cfg := &v3.Cfg{Version: v3.Version}
+			Expect(cfg.SetPluginChain([]string{pluginGoKubebuilderV4, pluginDeclarativeGoV1})).To(Succeed())
+
+			e := editSubcommand{
+				Path: pluginScriptPath,
+				Args: []string{"--multigroup"},
+			}
+
+			Expect(e.InjectConfig(cfg)).To(Succeed())
+
+			err := e.Scaffold(fs)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(pluginChainCaptured).To(Equal([]string{pluginGoKubebuilderV4, pluginDeclarativeGoV1}))
+		})
+	})
+})
+
+func getFlags() []external.Flag {
+	return []external.Flag{
+		{
+			Name:    "captain",
+			Type:    flagTypeString,
+			Usage:   "specify the ship captain",
+			Default: "jack-sparrow",
+		},
+		{
+			Name:    "sail",
+			Type:    flagTypeBool,
+			Usage:   "deploy the sail",
+			Default: "false",
+		},
+		{
+			Name:    "crew-count",
+			Type:    "int",
+			Usage:   "number of crew members",
+			Default: "123",
+		},
+		{
+			Name:    "treasure-value",
+			Type:    "float",
+			Usage:   "value of treasure on board the ship",
+			Default: "123.45",
+		},
+	}
+}
+
+func getMetadata() plugin.SubcommandMetadata {
+	return plugin.SubcommandMetadata{
+		Description: "Test description",
+		Examples:    "Test examples",
+	}
+}
+
+var _ = Describe("Plugin", func() {
+	var p Plugin
+
+	BeforeEach(func() {
+		p = Plugin{
+			PName:    "testplugin",
+			PVersion: plugin.Version{Number: 1},
+			PSupportedProjectVersions: []config.Version{
+				{Number: 3},
+			},
+			Path: "/path/to/plugin",
+			Args: []string{argFlag, argValue},
+		}
+	})
+
+	It("should return the plugin name", func() {
+		Expect(p.Name()).To(Equal("testplugin"))
+	})
+
+	It("should return the plugin version", func() {
+		Expect(p.Version()).To(Equal(plugin.Version{Number: 1}))
+	})
+
+	It("should return supported project versions", func() {
+		Expect(p.SupportedProjectVersions()).To(Equal([]config.Version{{Number: 3}}))
+	})
+
+	It("should return init subcommand", func() {
+		sub := p.GetInitSubcommand()
+		Expect(sub).NotTo(BeNil())
+		initSub, ok := sub.(*initSubcommand)
+		Expect(ok).To(BeTrue())
+		Expect(initSub.Path).To(Equal("/path/to/plugin"))
+		Expect(initSub.Args).To(Equal([]string{argFlag, argValue}))
+	})
+
+	It("should return create API subcommand", func() {
+		sub := p.GetCreateAPISubcommand()
+		Expect(sub).NotTo(BeNil())
+		apiSub, ok := sub.(*createAPISubcommand)
+		Expect(ok).To(BeTrue())
+		Expect(apiSub.Path).To(Equal("/path/to/plugin"))
+		Expect(apiSub.Args).To(Equal([]string{argFlag, argValue}))
+	})
+
+	It("should return create webhook subcommand", func() {
+		sub := p.GetCreateWebhookSubcommand()
+		Expect(sub).NotTo(BeNil())
+		webhookSub, ok := sub.(*createWebhookSubcommand)
+		Expect(ok).To(BeTrue())
+		Expect(webhookSub.Path).To(Equal("/path/to/plugin"))
+		Expect(webhookSub.Args).To(Equal([]string{argFlag, argValue}))
+	})
+
+	It("should return edit subcommand", func() {
+		sub := p.GetEditSubcommand()
+		Expect(sub).NotTo(BeNil())
+		editSub, ok := sub.(*editSubcommand)
+		Expect(ok).To(BeTrue())
+		Expect(editSub.Path).To(Equal("/path/to/plugin"))
+		Expect(editSub.Args).To(Equal([]string{argFlag, argValue}))
+	})
+
+	It("should return empty deprecation warning", func() {
+		Expect(p.DeprecationWarning()).To(BeEmpty())
+	})
+})

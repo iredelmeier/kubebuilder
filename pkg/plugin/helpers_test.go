@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,17 +17,19 @@ limitations under the License.
 package plugin
 
 import (
-	"sort"
+	"slices"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/stage"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/stage"
 )
 
 const (
+	testPluginDeployImageGo   = "deploy-image.go.kubebuilder.io"
+	testPluginGoKubebuilderV4 = "go.kubebuilder.io/v4"
+
 	short = "go"
 	name  = "go.kubebuilder.io"
 	key   = "go.kubebuilder.io/v1"
@@ -62,12 +64,6 @@ var _ = Describe("SplitKey", func() {
 		n, v := SplitKey(name)
 		Expect(n).To(Equal(name))
 		Expect(v).To(Equal(""))
-	})
-})
-
-var _ = Describe("GetShortName", func() {
-	It("should extract base names from domains", func() {
-		Expect(GetShortName(name)).To(Equal(short))
 	})
 })
 
@@ -123,9 +119,13 @@ var _ = Describe("ValidateKey", func() {
 })
 
 var _ = Describe("SupportsVersion", func() {
-	plugin := mockPlugin{
-		supportedProjectVersions: supportedProjectVersions,
-	}
+	var plugin mockPlugin
+
+	BeforeEach(func() {
+		plugin = mockPlugin{
+			supportedProjectVersions: supportedProjectVersions,
+		}
+	})
 
 	It("should return true for supported versions", func() {
 		Expect(SupportsVersion(plugin, config.Version{Number: 2})).To(BeTrue())
@@ -181,10 +181,95 @@ var _ = Describe("CommonSupportedProjectVersions", func() {
 			{plugins: []Plugin{p1, p2, p3, p4}, versions: []config.Version{}},
 		} {
 			versions := CommonSupportedProjectVersions(tc.plugins...)
-			sort.Slice(versions, func(i int, j int) bool {
-				return versions[i].Compare(versions[j]) == -1
+			slices.SortStableFunc(versions, func(a, b config.Version) int {
+				return a.Compare(b)
 			})
 			Expect(versions).To(Equal(tc.versions))
 		}
+	})
+})
+
+var _ = Describe("GetPluginKeyForConfig", func() {
+	It("should return the plugin's own key when it's in the plugin chain", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+			"deploy-image.go.kubebuilder.io/v1-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.go.kubebuilder.io/v1-alpha"))
+	})
+
+	It("should return the bundle key when plugin is wrapped in a bundle", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+			"deploy-image.my-domain/v1-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.my-domain/v1-alpha"))
+	})
+
+	It("should fallback to plugin's own key when no match in chain", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.go.kubebuilder.io/v1-alpha"))
+	})
+
+	It("should match on base name and version", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+			"deploy-image.operator-sdk.io/v1-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.operator-sdk.io/v1-alpha"))
+	})
+
+	It("should not match if version differs", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+			"deploy-image.my-domain/v2-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.go.kubebuilder.io/v1-alpha"))
+	})
+
+	It("should not match if base name differs", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			testPluginGoKubebuilderV4,
+			"other-plugin.my-domain/v1-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.go.kubebuilder.io/v1-alpha"))
+	})
+
+	It("should choose the first matching bundle when multiple candidates exist", func() {
+		plugin := mockPlugin{
+			name:    testPluginDeployImageGo,
+			version: Version{Number: 1, Stage: stage.Alpha},
+		}
+		pluginChain := []string{
+			"deploy-image.first.example.com/v1-alpha",
+			"deploy-image.second.example.com/v1-alpha",
+		}
+		Expect(GetPluginKeyForConfig(pluginChain, plugin)).To(Equal("deploy-image.first.example.com/v1-alpha"))
 	})
 })

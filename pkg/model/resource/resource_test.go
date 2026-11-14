@@ -17,23 +17,29 @@ limitations under the License.
 package resource
 
 import (
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	"strings"
+
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
-//nolint:dupl
 var _ = Describe("Resource", func() {
 	const (
-		group   = "group"
-		domain  = "test.io"
-		version = "v1"
-		kind    = "Kind"
-		plural  = "kinds"
-		v1beta1 = "v1beta1"
+		group         = "group"
+		domain        = "test.io"
+		version       = "v1"
+		kind          = "Kind"
+		plural        = "kinds"
+		v1beta1       = "v1beta1"
+		invalidPlural = "plural"
 	)
 
 	var (
+		gvk GVK
+		res Resource
+	)
+
+	BeforeEach(func() {
 		gvk = GVK{
 			Group:   group,
 			Domain:  domain,
@@ -44,20 +50,106 @@ var _ = Describe("Resource", func() {
 			GVK:    gvk,
 			Plural: plural,
 		}
-	)
+	})
 
 	Context("Validate", func() {
 		It("should succeed for a valid Resource", func() {
 			Expect(res.Validate()).To(Succeed())
 		})
 
+		It("should succeed with empty API", func() {
+			Expect(Resource{GVK: gvk, Plural: plural, API: &API{}}.Validate()).To(Succeed())
+		})
+
+		It("should succeed with empty Webhooks", func() {
+			Expect(Resource{GVK: gvk, Plural: plural, Webhooks: &Webhooks{}}.Validate()).To(Succeed())
+		})
+
+		It("should succeed with nil API", func() {
+			Expect(Resource{GVK: gvk, Plural: plural, API: nil}.Validate()).To(Succeed())
+		})
+
+		It("should succeed with nil Webhooks", func() {
+			Expect(Resource{GVK: gvk, Plural: plural, Webhooks: nil}.Validate()).To(Succeed())
+		})
+
+		It("should fail for invalid Plural with specific error", func() {
+			r := Resource{GVK: gvk, Plural: "Plural"}
+			err := r.Validate()
+			Expect(err).NotTo(Succeed())
+			Expect(err.Error()).To(ContainSubstring("invalid Plural"))
+		})
+
+		It("should fail for invalid API with wrapped error", func() {
+			r := Resource{GVK: gvk, Plural: plural, API: &API{CRDVersion: "1"}}
+			err := r.Validate()
+			Expect(err).NotTo(Succeed())
+			Expect(err.Error()).To(ContainSubstring("invalid API"))
+		})
+
+		It("should fail for invalid Webhooks with wrapped error", func() {
+			r := Resource{GVK: gvk, Plural: plural, Webhooks: &Webhooks{WebhookVersion: "1"}}
+			err := r.Validate()
+			Expect(err).NotTo(Succeed())
+			Expect(err.Error()).To(ContainSubstring("invalid Webhooks"))
+		})
+
 		DescribeTable("should fail for invalid Resources",
 			func(res Resource) { Expect(res.Validate()).NotTo(Succeed()) },
 			// Ensure that the rest of the fields are valid to check each part
-			Entry("invalid GVK", Resource{GVK: GVK{}, Plural: "plural"}),
+			Entry("invalid GVK", Resource{GVK: GVK{}, Plural: invalidPlural}),
 			Entry("invalid Plural", Resource{GVK: gvk, Plural: "Plural"}),
-			Entry("invalid API", Resource{GVK: gvk, Plural: "plural", API: &API{CRDVersion: "1"}}),
-			Entry("invalid Webhooks", Resource{GVK: gvk, Plural: "plural", Webhooks: &Webhooks{WebhookVersion: "1"}}),
+			Entry("invalid API", Resource{GVK: gvk, Plural: invalidPlural, API: &API{CRDVersion: "1"}}),
+			Entry("invalid Webhooks", Resource{GVK: gvk, Plural: invalidPlural, Webhooks: &Webhooks{WebhookVersion: "1"}}),
+		)
+
+		DescribeTable("should succeed for valid Paths",
+			func(p string) {
+				Expect(Resource{GVK: gvk, Plural: plural, Path: p}.Validate()).To(Succeed())
+			},
+			Entry("empty path (partial resource)", ""),
+			Entry("simple relative path", "api/v1"),
+			Entry("full module import path", "github.com/org/repo/api/v1"),
+			Entry("mixed-case import path", "GitHub.com/Org/Repo/api/v1"),
+			Entry("versioned domain", "gopkg.in/yaml.v3"),
+			Entry("multi-segment path with hyphen", "github.com/my-org/my-repo/api/v1"),
+			Entry("k8s core path", "k8s.io/api/core/v1"),
+		)
+
+		DescribeTable("should succeed for valid external Paths",
+			func(p string) {
+				Expect(Resource{GVK: gvk, Plural: plural, External: true, Path: p}.Validate()).To(Succeed())
+			},
+			Entry("full module import path", "github.com/org/repo/api/v1"),
+			Entry("k8s core path", "k8s.io/api/core/v1"),
+		)
+
+		DescribeTable("should fail for invalid Paths",
+			func(p, message string) {
+				err := Resource{GVK: gvk, Plural: plural, Path: p}.Validate()
+				Expect(err).NotTo(Succeed())
+				Expect(err.Error()).To(ContainSubstring("invalid Path"))
+				Expect(err.Error()).To(ContainSubstring(message))
+			},
+			Entry("absolute filesystem path", "/absolute/path", "empty path element"),
+			Entry("path traversal", "../traversal", `invalid path element ".."`),
+			Entry("double slash", "a//b", "double slash"),
+			Entry("trailing slash", "path/", "trailing slash"),
+		)
+
+		DescribeTable("should fail for invalid external Paths",
+			func(p, message string) {
+				err := Resource{GVK: gvk, Plural: plural, External: true, Path: p}.Validate()
+				Expect(err).NotTo(Succeed())
+				Expect(err.Error()).To(ContainSubstring("invalid Path"))
+				Expect(err.Error()).To(ContainSubstring(message))
+			},
+			Entry("empty path", "", "external resources must specify a path"),
+			Entry("bare domain", "example.com", "must include a package sub-path"),
+			Entry("absolute filesystem path", "/absolute/path", "must be a valid Go import path"),
+			Entry("relative package path", "api/v1", "must be a fully-qualified Go import path"),
+			Entry("leading-dot pseudo-domain", ".com/api/v1", "must be a fully-qualified Go import path"),
+			Entry("module version in path", "github.com/org/repo@v1.0.0", "version specifiers belong in the module field"),
 		)
 	})
 
@@ -71,6 +163,13 @@ var _ = Describe("Resource", func() {
 		)
 
 		var (
+			resNoGroup     Resource
+			resNoDomain    Resource
+			resHyphenGroup Resource
+			resDotGroup    Resource
+		)
+
+		BeforeEach(func() {
 			resNoGroup = Resource{
 				GVK: GVK{
 					// Empty group
@@ -103,24 +202,28 @@ var _ = Describe("Resource", func() {
 					Kind:    kind,
 				},
 			}
-		)
+		})
 
 		DescribeTable("PackageName should return the correct string",
-			func(res Resource, packageName string) { Expect(res.PackageName()).To(Equal(packageName)) },
-			Entry("fully qualified resource", res, group),
-			Entry("empty group name", resNoGroup, safeDomain),
-			Entry("empty domain", resNoDomain, group),
-			Entry("hyphen-containing group", resHyphenGroup, safeGroup),
-			Entry("dot-containing group", resDotGroup, safeGroup),
+			func(getRes func() Resource, expected string) {
+				Expect(getRes().PackageName()).To(Equal(expected))
+			},
+			Entry("fully qualified resource", func() Resource { return res }, group),
+			Entry("empty group name", func() Resource { return resNoGroup }, safeDomain),
+			Entry("empty domain", func() Resource { return resNoDomain }, group),
+			Entry("hyphen-containing group", func() Resource { return resHyphenGroup }, safeGroup),
+			Entry("dot-containing group", func() Resource { return resDotGroup }, safeGroup),
 		)
 
 		DescribeTable("ImportAlias",
-			func(res Resource, importAlias string) { Expect(res.ImportAlias()).To(Equal(importAlias)) },
-			Entry("fully qualified resource", res, groupVersion),
-			Entry("empty group name", resNoGroup, domainVersion),
-			Entry("empty domain", resNoDomain, groupVersion),
-			Entry("hyphen-containing group", resHyphenGroup, safeAlias),
-			Entry("dot-containing group", resDotGroup, safeAlias),
+			func(getRes func() Resource, expected string) {
+				Expect(getRes().ImportAlias()).To(Equal(expected))
+			},
+			Entry("fully qualified resource", func() Resource { return res }, groupVersion),
+			Entry("empty group name", func() Resource { return resNoGroup }, domainVersion),
+			Entry("empty domain", func() Resource { return resNoDomain }, groupVersion),
+			Entry("hyphen-containing group", func() Resource { return resHyphenGroup }, safeAlias),
+			Entry("dot-containing group", func() Resource { return resDotGroup }, safeAlias),
 		)
 	})
 
@@ -192,6 +295,16 @@ var _ = Describe("Resource", func() {
 				Expect(Resource{GVK: gvk, Plural: "types"}.IsRegularPlural()).To(BeFalse())
 			})
 		})
+
+		Context("IsExternal", func() {
+			It("should return true if the resource is external", func() {
+				Expect(Resource{External: true}.IsExternal()).To(BeTrue())
+			})
+
+			It("should return false if the resource is not external", func() {
+				Expect(Resource{External: false}.IsExternal()).To(BeFalse())
+			})
+		})
 	})
 
 	Context("Copy", func() {
@@ -201,22 +314,24 @@ var _ = Describe("Resource", func() {
 			webhookVersion = "v1"
 		)
 
-		res := Resource{
-			GVK:    gvk,
-			Plural: plural,
-			Path:   path,
-			API: &API{
-				CRDVersion: crdVersion,
-				Namespaced: true,
-			},
-			Controller: true,
-			Webhooks: &Webhooks{
-				WebhookVersion: webhookVersion,
-				Defaulting:     true,
-				Validation:     true,
-				Conversion:     true,
-			},
-		}
+		BeforeEach(func() {
+			res = Resource{
+				GVK:    gvk,
+				Plural: plural,
+				Path:   path,
+				API: &API{
+					CRDVersion: crdVersion,
+					Namespaced: true,
+				},
+				Controller: true,
+				Webhooks: &Webhooks{
+					WebhookVersion: webhookVersion,
+					Defaulting:     true,
+					Validation:     true,
+					Conversion:     true,
+				},
+			}
+		})
 
 		It("should return an exact copy", func() {
 			other := res.Copy()
@@ -235,6 +350,7 @@ var _ = Describe("Resource", func() {
 			Expect(other.Webhooks.Defaulting).To(Equal(res.Webhooks.Defaulting))
 			Expect(other.Webhooks.Validation).To(Equal(res.Webhooks.Validation))
 			Expect(other.Webhooks.Conversion).To(Equal(res.Webhooks.Conversion))
+			Expect(other.Webhooks.Spoke).To(Equal(res.Webhooks.Spoke))
 		})
 
 		It("modifying the copy should not affect the original", func() {
@@ -270,6 +386,17 @@ var _ = Describe("Resource", func() {
 			Expect(res.Webhooks.Defaulting).To(BeTrue())
 			Expect(res.Webhooks.Validation).To(BeTrue())
 			Expect(res.Webhooks.Conversion).To(BeTrue())
+		})
+
+		It("should not share the controller list with the copy", func() {
+			res.Controllers = &Controllers{{Name: "captain"}, {Name: "captain-backup"}}
+
+			other := res.Copy()
+			(*other.Controllers)[0].Name = "changed"
+			Expect(other.Controllers.AddController("captain-nightly")).To(Succeed())
+			other.Controllers = nil
+
+			Expect(res.Controllers).To(Equal(&Controllers{{Name: "captain"}, {Name: "captain-backup"}}))
 		})
 	})
 
@@ -357,17 +484,19 @@ var _ = Describe("Resource", func() {
 		})
 
 		Context("Controller", func() {
-			It("should set the controller flag if provided and not previously set", func() {
+			It("should record the controller if provided and not previously set", func() {
 				r = Resource{GVK: gvk}
 				other = Resource{
 					GVK:        gvk,
 					Controller: true,
 				}
 				Expect(r.Update(other)).To(Succeed())
-				Expect(r.Controller).To(BeTrue())
+				Expect(r.HasController()).To(BeTrue())
+				Expect(r.Controller).To(BeFalse())
+				Expect(r.GetControllerNames()).To(Equal([]string{strings.ToLower(kind)}))
 			})
 
-			It("should keep the controller flag if previously set", func() {
+			It("should keep the controller if previously set", func() {
 				r = Resource{
 					GVK:        gvk,
 					Controller: true,
@@ -376,7 +505,8 @@ var _ = Describe("Resource", func() {
 				By("not providing it")
 				other = Resource{GVK: gvk}
 				Expect(r.Update(other)).To(Succeed())
-				Expect(r.Controller).To(BeTrue())
+				Expect(r.HasController()).To(BeTrue())
+				Expect(r.GetControllerNames()).To(Equal([]string{strings.ToLower(kind)}))
 
 				By("providing it")
 				other = Resource{
@@ -384,7 +514,9 @@ var _ = Describe("Resource", func() {
 					Controller: true,
 				}
 				Expect(r.Update(other)).To(Succeed())
-				Expect(r.Controller).To(BeTrue())
+				Expect(r.HasController()).To(BeTrue())
+				Expect(r.Controller).To(BeFalse())
+				Expect(r.GetControllerNames()).To(Equal([]string{strings.ToLower(kind)}))
 			})
 
 			It("should not set the controller flag if not provided and not previously set", func() {
@@ -392,6 +524,22 @@ var _ = Describe("Resource", func() {
 				other = Resource{GVK: gvk}
 				Expect(r.Update(other)).To(Succeed())
 				Expect(r.Controller).To(BeFalse())
+			})
+
+			It("should leave the resource unchanged if the merged controllers are invalid", func() {
+				r = Resource{
+					GVK:         gvk,
+					Controllers: &Controllers{{Name: "kind-backup"}},
+				}
+				original := r.Copy()
+				other = Resource{
+					GVK:         gvk,
+					Path:        "api/v1",
+					API:         &API{CRDVersion: v1, Namespaced: true},
+					Controllers: &Controllers{{Name: "kind--backup"}},
+				}
+				Expect(r.Update(other)).NotTo(Succeed())
+				Expect(r).To(Equal(original))
 			})
 		})
 
@@ -424,16 +572,22 @@ var _ = Describe("Resource", func() {
 	})
 
 	Context("Replacer", func() {
-		replacer := res.Replacer()
+		var replacer *strings.Replacer
+
+		BeforeEach(func() {
+			replacer = res.Replacer()
+		})
 
 		DescribeTable("should replace the following strings",
-			func(pattern, result string) { Expect(replacer.Replace(pattern)).To(Equal(result)) },
-			Entry("no pattern", "version", "version"),
-			Entry("pattern `%[group]`", "%[group]", res.Group),
-			Entry("pattern `%[version]`", "%[version]", res.Version),
-			Entry("pattern `%[kind]`", "%[kind]", "kind"),
-			Entry("pattern `%[plural]`", "%[plural]", res.Plural),
-			Entry("pattern `%[package-name]`", "%[package-name]", res.PackageName()),
+			func(pattern string, expected func() string) {
+				Expect(replacer.Replace(pattern)).To(Equal(expected()))
+			},
+			Entry("no pattern", "version", func() string { return "version" }),
+			Entry("pattern `%[group]`", "%[group]", func() string { return res.Group }),
+			Entry("pattern `%[version]`", "%[version]", func() string { return res.Version }),
+			Entry("pattern `%[kind]`", "%[kind]", func() string { return "kind" }),
+			Entry("pattern `%[plural]`", "%[plural]", func() string { return res.Plural }),
+			Entry("pattern `%[package-name]`", "%[package-name]", func() string { return res.PackageName() }),
 		)
 	})
 })

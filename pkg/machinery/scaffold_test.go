@@ -16,15 +16,16 @@ package machinery
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"time"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/ginkgo/extensions/table"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/spf13/afero"
 
-	cfgv3 "sigs.k8s.io/kubebuilder/v3/pkg/config/v3"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 var _ = Describe("Scaffold", func() {
@@ -32,31 +33,31 @@ var _ = Describe("Scaffold", func() {
 		It("should succeed for no option", func() {
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()})
 			Expect(s.fs).NotTo(BeNil())
-			Expect(s.dirPerm).To(Equal(defaultDirectoryPermission))
-			Expect(s.filePerm).To(Equal(defaultFilePermission))
+			Expect(s.dirPerm).To(Equal(DefaultDirectoryPermission))
+			Expect(s.filePerm).To(Equal(DefaultFilePermission))
 			Expect(s.injector.config).To(BeNil())
 			Expect(s.injector.boilerplate).To(Equal(""))
 			Expect(s.injector.resource).To(BeNil())
 		})
 
 		It("should succeed with directory permissions option", func() {
-			const dirPermissions os.FileMode = 0755
+			const dirPermissions os.FileMode = 0o755
 
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithDirectoryPermissions(dirPermissions))
 			Expect(s.fs).NotTo(BeNil())
 			Expect(s.dirPerm).To(Equal(dirPermissions))
-			Expect(s.filePerm).To(Equal(defaultFilePermission))
+			Expect(s.filePerm).To(Equal(DefaultFilePermission))
 			Expect(s.injector.config).To(BeNil())
 			Expect(s.injector.boilerplate).To(Equal(""))
 			Expect(s.injector.resource).To(BeNil())
 		})
 
 		It("should succeed with file permissions option", func() {
-			const filePermissions os.FileMode = 0755
+			const filePermissions os.FileMode = 0o755
 
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithFilePermissions(filePermissions))
 			Expect(s.fs).NotTo(BeNil())
-			Expect(s.dirPerm).To(Equal(defaultDirectoryPermission))
+			Expect(s.dirPerm).To(Equal(DefaultDirectoryPermission))
 			Expect(s.filePerm).To(Equal(filePermissions))
 			Expect(s.injector.config).To(BeNil())
 			Expect(s.injector.boilerplate).To(Equal(""))
@@ -68,8 +69,8 @@ var _ = Describe("Scaffold", func() {
 
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithConfig(cfg))
 			Expect(s.fs).NotTo(BeNil())
-			Expect(s.dirPerm).To(Equal(defaultDirectoryPermission))
-			Expect(s.filePerm).To(Equal(defaultFilePermission))
+			Expect(s.dirPerm).To(Equal(DefaultDirectoryPermission))
+			Expect(s.filePerm).To(Equal(DefaultFilePermission))
 			Expect(s.injector.config).NotTo(BeNil())
 			Expect(s.injector.config.GetVersion().Compare(cfgv3.Version)).To(Equal(0))
 			Expect(s.injector.boilerplate).To(Equal(""))
@@ -81,15 +82,15 @@ var _ = Describe("Scaffold", func() {
 
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithBoilerplate(boilerplate))
 			Expect(s.fs).NotTo(BeNil())
-			Expect(s.dirPerm).To(Equal(defaultDirectoryPermission))
-			Expect(s.filePerm).To(Equal(defaultFilePermission))
+			Expect(s.dirPerm).To(Equal(DefaultDirectoryPermission))
+			Expect(s.filePerm).To(Equal(DefaultFilePermission))
 			Expect(s.injector.config).To(BeNil())
 			Expect(s.injector.boilerplate).To(Equal(boilerplate))
 			Expect(s.injector.resource).To(BeNil())
 		})
 
 		It("should succeed with resource option", func() {
-			var res = &resource.Resource{GVK: resource.GVK{
+			res := &resource.Resource{GVK: resource.GVK{
 				Group:   "group",
 				Domain:  "my.domain",
 				Version: "v1",
@@ -98,13 +99,67 @@ var _ = Describe("Scaffold", func() {
 
 			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithResource(res))
 			Expect(s.fs).NotTo(BeNil())
-			Expect(s.dirPerm).To(Equal(defaultDirectoryPermission))
-			Expect(s.filePerm).To(Equal(defaultFilePermission))
+			Expect(s.dirPerm).To(Equal(DefaultDirectoryPermission))
+			Expect(s.filePerm).To(Equal(DefaultFilePermission))
 			Expect(s.injector.config).To(BeNil())
 			Expect(s.injector.boilerplate).To(Equal(""))
 			Expect(s.injector.resource).NotTo(BeNil())
 			Expect(s.injector.resource.GVK.IsEqualTo(res.GVK)).To(BeTrue())
 		})
+	})
+
+	Describe("SubstituteYear", func() {
+		BeforeEach(func() {
+			nowFunc = func() time.Time {
+				return time.Date(2025, time.January, 1, 0, 30, 0, 0, time.FixedZone("UTC+1", 60*60))
+			}
+		})
+
+		AfterEach(func() {
+			nowFunc = time.Now
+		})
+
+		It("should replace YEAR with the current local year", func() {
+			Expect(SubstituteYear("Copyright YEAR The Authors.")).
+				To(Equal("Copyright 2025 The Authors."))
+		})
+
+		It("should leave strings without YEAR unchanged", func() {
+			Expect(SubstituteYear("Copyright 2024 The Authors.")).
+				To(Equal("Copyright 2024 The Authors."))
+		})
+
+		It("should return an empty string unchanged", func() {
+			Expect(SubstituteYear("")).To(Equal(""))
+		})
+
+		It("should substitute YEAR when boilerplate is provided via WithBoilerplate", func() {
+			s := NewScaffold(Filesystem{FS: afero.NewMemMapFs()},
+				WithBoilerplate("Copyright YEAR The Authors."))
+			Expect(s.injector.boilerplate).To(Equal("Copyright 2025 The Authors."))
+		})
+
+		DescribeTable("should replace only standalone YEAR placeholders",
+			func(input, expected string) {
+				Expect(SubstituteYear(input)).To(Equal(expected))
+			},
+			Entry("replaces multiple standalone placeholders",
+				"Copyright YEAR-YEAR The Authors.",
+				"Copyright 2025-2025 The Authors.",
+			),
+			Entry("replaces standalone placeholders next to punctuation",
+				"Copyright (YEAR), The Authors.",
+				"Copyright (2025), The Authors.",
+			),
+			Entry("does not replace YEAR inside another word",
+				"Copyright YEAR GOODYEAR PREYEAR YEARLY Authors.",
+				"Copyright 2025 GOODYEAR PREYEAR YEARLY Authors.",
+			),
+			Entry("does not replace YEAR next to digits or underscores",
+				"Copyright YEAR YEAR2024 2024YEAR YEAR_2024 Authors.",
+				"Copyright 2025 YEAR2024 2024YEAR YEAR_2024 Authors.",
+			),
+		)
 	})
 
 	Describe("Scaffold.Execute", func() {
@@ -116,12 +171,12 @@ var _ = Describe("Scaffold", func() {
 		)
 
 		var (
-			testErr = errors.New("error text")
-
-			s *Scaffold
+			testErr error
+			s       *Scaffold
 		)
 
 		BeforeEach(func() {
+			testErr = errors.New("error text")
 			s = &Scaffold{fs: afero.NewMemMapFs()}
 		})
 
@@ -135,48 +190,72 @@ var _ = Describe("Scaffold", func() {
 			},
 			Entry("should write the file",
 				path, content,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}, body: content},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path}, body: content},
 			),
 			Entry("should skip optional models if already have one",
 				path, content,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}, body: content},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path}, body: content},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
 			),
 			Entry("should overwrite required models if already have one",
 				path, content,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: OverwriteFile}, body: content},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: OverwriteFile}, body: content},
 			),
 			Entry("should format a go file",
 				pathGo, "package file\n",
-				fakeTemplate{fakeBuilder: fakeBuilder{path: pathGo}, body: "package    file"},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: pathGo}, body: "package    file"},
+			),
+
+			Entry("should render actions correctly",
+				path, "package testValue",
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path, TestField: "testValue"}, body: "package {{.TestField}}"},
+			),
+
+			Entry("should render actions with alternative delimiters correctly",
+				path, "package testValue",
+				&fakeTemplate{
+					fakeBuilder:     fakeBuilder{path: path, TestField: "testValue"},
+					body:            "package [[.TestField]]",
+					parseDelimLeft:  "[[",
+					parseDelimRight: "]]",
+				},
 			),
 		)
 
 		DescribeTable("file builders related errors",
-			func(errType interface{}, files ...Builder) {
+			func(setup func() ([]Builder, error)) {
+				files, errType := setup()
+
 				err := s.Execute(files...)
+
 				Expect(err).To(HaveOccurred())
-				Expect(errors.As(err, errType)).To(BeTrue())
+				Expect(err).To(MatchError(errType))
 			},
-			Entry("should fail if unable to validate a file builder",
-				&ValidateError{},
-				fakeRequiresValidation{validateErr: testErr},
-			),
-			Entry("should fail if unable to set default values for a template",
-				&SetTemplateDefaultsError{},
-				fakeTemplate{err: testErr},
-			),
-			Entry("should fail if an unexpected previous model is found",
-				&ModelAlreadyExistsError{},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: Error}},
-			),
-			Entry("should fail if behavior if-exists-action is not defined",
-				&UnknownIfExistsActionError{},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: -1}},
-			),
+			Entry("should fail if unable to validate a file builder", func() ([]Builder, error) {
+				return []Builder{
+					fakeRequiresValidation{validateErr: testErr},
+				}, ValidateError{testErr}
+			}),
+
+			Entry("should fail if unable to set default values for a template", func() ([]Builder, error) {
+				return []Builder{
+					&fakeTemplate{err: testErr},
+				}, SetTemplateDefaultsError{testErr}
+			}),
+
+			Entry("should fail if an unexpected previous model is found", func() ([]Builder, error) {
+				return []Builder{
+					&fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
+					&fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: Error}},
+				}, ModelAlreadyExistsError{path: path}
+			}),
+			Entry("should fail if behavior if-exists-action is not defined", func() ([]Builder, error) {
+				return []Builder{
+					&fakeTemplate{fakeBuilder: fakeBuilder{path: path}},
+					&fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: -1}},
+				}, UnknownIfExistsActionError{path: path, ifExistsAction: -1}
+			}),
 		)
 
 		// Following errors are unwrapped, so we need to check for substrings
@@ -188,21 +267,21 @@ var _ = Describe("Scaffold", func() {
 			},
 			Entry("should fail if a template is broken",
 				"template: ",
-				fakeTemplate{body: "{{ .Field }"},
+				&fakeTemplate{body: "{{ .Field }"},
 			),
 			Entry("should fail if a template params aren't provided",
 				"template: ",
-				fakeTemplate{body: "{{ .Field }}"},
+				&fakeTemplate{body: "{{ .Field }}"},
 			),
 			Entry("should fail if unable to format a go file",
 				"expected 'package', found ",
-				fakeTemplate{fakeBuilder: fakeBuilder{path: pathGo}, body: content},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: pathGo}, body: content},
 			),
 		)
 
 		DescribeTable("insert strings",
 			func(path, input, expected string, files ...Builder) {
-				Expect(afero.WriteFile(s.fs, path, []byte(input), 0666)).To(Succeed())
+				Expect(afero.WriteFile(s.fs, path, []byte(input), 0o666)).To(Succeed())
 
 				Expect(s.Execute(files...)).To(Succeed())
 
@@ -214,14 +293,14 @@ var _ = Describe("Scaffold", func() {
 				pathGo,
 				`package test
 
-//+kubebuilder:scaffold:-
+// +kubebuilder:scaffold:-
 `,
 				`package test
 
 var a int
 var b int
 
-//+kubebuilder:scaffold:-
+// +kubebuilder:scaffold:-
 `,
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathGo},
@@ -233,12 +312,12 @@ var b int
 			Entry("should insert lines for yaml files",
 				pathYaml,
 				`
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
 				`
 1
 2
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -253,10 +332,10 @@ var b int
 				`
 1
 2
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml, ifExistsAction: OverwriteFile}, body: `
-#+kubebuilder:scaffold:-
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml, ifExistsAction: OverwriteFile}, body: `
+# +kubebuilder:scaffold:-
 `},
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -271,10 +350,10 @@ var b int
 				`
 1
 2
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml, ifExistsAction: OverwriteFile}, body: `
-#+kubebuilder:scaffold:-
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml, ifExistsAction: OverwriteFile}, body: `
+# +kubebuilder:scaffold:-
 `},
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -286,14 +365,14 @@ var b int
 			Entry("should use files over optional models",
 				pathYaml,
 				`
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
 				`
 1
 2
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
-				fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml}, body: content},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: pathYaml}, body: content},
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
 					codeFragments: CodeFragmentsMap{
@@ -304,14 +383,14 @@ var b int
 			Entry("should filter invalid markers",
 				pathYaml,
 				`
-#+kubebuilder:scaffold:-
-#+kubebuilder:scaffold:*
+# +kubebuilder:scaffold:-
+# +kubebuilder:scaffold:*
 `,
 				`
 1
 2
-#+kubebuilder:scaffold:-
-#+kubebuilder:scaffold:*
+# +kubebuilder:scaffold:-
+# +kubebuilder:scaffold:*
 `,
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -326,18 +405,18 @@ var b int
 				pathYaml,
 				`
 1
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 3
 4
-#+kubebuilder:scaffold:*
+# +kubebuilder:scaffold:*
 `,
 				`
 1
 2
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 3
 4
-#+kubebuilder:scaffold:*
+# +kubebuilder:scaffold:*
 `,
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -347,13 +426,42 @@ var b int
 					},
 				},
 			),
+			Entry("should filter already existing multi-line indented code fragments",
+				pathGo,
+				`package test
+
+func init() {
+	if err := something(); err != nil {
+		return err
+	}
+	
+	// +kubebuilder:scaffold:-
+}
+`,
+				`package test
+
+func init() {
+	if err := something(); err != nil {
+		return err
+	}
+	
+	// +kubebuilder:scaffold:-
+}
+`,
+				fakeInserter{
+					fakeBuilder: fakeBuilder{path: pathGo},
+					codeFragments: CodeFragmentsMap{
+						NewMarkerFor(pathGo, "-"): {"if err := something(); err != nil {\n\treturn err\n}\n\n"},
+					},
+				},
+			),
 			Entry("should not insert anything if no code fragment",
 				pathYaml,
 				`
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
 				`
-#+kubebuilder:scaffold:-
+# +kubebuilder:scaffold:-
 `,
 				fakeInserter{
 					fakeBuilder: fakeBuilder{path: pathYaml},
@@ -365,32 +473,32 @@ var b int
 		)
 
 		DescribeTable("insert strings related errors",
-			func(errType interface{}, files ...Builder) {
-				Expect(afero.WriteFile(s.fs, path, []byte{}, 0666)).To(Succeed())
+			func(errType error, files ...Builder) {
+				Expect(afero.WriteFile(s.fs, path, []byte{}, 0o666)).To(Succeed())
 
 				err := s.Execute(files...)
 				Expect(err).To(HaveOccurred())
-				Expect(errors.As(err, errType)).To(BeTrue())
+				Expect(err).To(MatchError(errType))
 			},
 			Entry("should fail if inserting into a model that fails when a file exists and it does exist",
-				&FileAlreadyExistsError{},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: "filename", ifExistsAction: Error}},
-				fakeInserter{fakeBuilder: fakeBuilder{path: "filename"}},
+				FileAlreadyExistsError{path: path},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: Error}},
+				fakeInserter{fakeBuilder: fakeBuilder{path: path}},
 			),
 			Entry("should fail if inserting into a model with unknown behavior if the file exists and it does exist",
-				&UnknownIfExistsActionError{},
-				fakeTemplate{fakeBuilder: fakeBuilder{path: "filename", ifExistsAction: -1}},
-				fakeInserter{fakeBuilder: fakeBuilder{path: "filename"}},
+				UnknownIfExistsActionError{path: path, ifExistsAction: -1},
+				&fakeTemplate{fakeBuilder: fakeBuilder{path: path, ifExistsAction: -1}},
+				fakeInserter{fakeBuilder: fakeBuilder{path: path}},
 			),
 		)
 
 		Context("write when the file already exists", func() {
 			BeforeEach(func() {
-				_ = afero.WriteFile(s.fs, path, []byte{}, 0666)
+				_ = afero.WriteFile(s.fs, path, []byte{}, 0o666)
 			})
 
 			It("should skip the file by default", func() {
-				Expect(s.Execute(fakeTemplate{
+				Expect(s.Execute(&fakeTemplate{
 					fakeBuilder: fakeBuilder{path: path},
 					body:        content,
 				})).To(Succeed())
@@ -401,7 +509,7 @@ var b int
 			})
 
 			It("should write the file if configured to do so", func() {
-				Expect(s.Execute(fakeTemplate{
+				Expect(s.Execute(&fakeTemplate{
 					fakeBuilder: fakeBuilder{path: path, ifExistsAction: OverwriteFile},
 					body:        content,
 				})).To(Succeed())
@@ -412,16 +520,95 @@ var b int
 			})
 
 			It("should error if configured to do so", func() {
-				err := s.Execute(fakeTemplate{
+				err := s.Execute(&fakeTemplate{
 					fakeBuilder: fakeBuilder{path: path, ifExistsAction: Error},
 					body:        content,
 				})
 				Expect(err).To(HaveOccurred())
-				Expect(errors.As(err, &FileAlreadyExistsError{})).To(BeTrue())
+				Expect(err).To(MatchError(FileAlreadyExistsError{path: path}))
+			})
+		})
+
+		It("should return the error from closing the written file", func() {
+			s.fs = closeErrorFs{Fs: afero.NewMemMapFs(), closeErr: testErr}
+
+			err := s.Execute(&fakeTemplate{fakeBuilder: fakeBuilder{path: path}, body: content})
+			Expect(err).To(MatchError(CloseFileError{testErr}))
+		})
+
+		Context("WithConfig option", func() {
+			It("should set repository in imports.LocalPrefix", func() {
+				cfg := cfgv3.New()
+				_ = cfg.SetRepository("github.com/example/test")
+
+				scaffold := NewScaffold(Filesystem{FS: afero.NewMemMapFs()}, WithConfig(cfg))
+
+				Expect(scaffold.injector.config).NotTo(BeNil())
+				Expect(scaffold.injector.config.GetRepository()).To(Equal("github.com/example/test"))
+			})
+		})
+
+		Context("inserter with missing file", func() {
+			It("should skip when IgnoreFile action is used", func() {
+				err := s.Execute(
+					fakeInserterWithIfNotExists{
+						fakeInserter: fakeInserter{
+							fakeBuilder: fakeBuilder{path: "missing.go"},
+							codeFragments: CodeFragmentsMap{
+								NewMarkerFor("missing.go", "-"): {"new code\n"},
+							},
+						},
+						ifNotExistsAction: IgnoreFile,
+					},
+				)
+
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			It("should error when ErrorIfNotExist action is used", func() {
+				err := s.Execute(
+					fakeInserterWithIfNotExists{
+						fakeInserter: fakeInserter{
+							fakeBuilder: fakeBuilder{path: "missing.go"},
+							codeFragments: CodeFragmentsMap{
+								NewMarkerFor("missing.go", "-"): {"new code\n"},
+							},
+						},
+						ifNotExistsAction: ErrorIfNotExist,
+					},
+				)
+
+				Expect(err).To(HaveOccurred())
 			})
 		})
 	})
 })
+
+// closeErrorFs is an afero.Fs whose files opened with OpenFile fail to close
+type closeErrorFs struct {
+	afero.Fs
+	closeErr error
+}
+
+// OpenFile implements afero.Fs
+func (fs closeErrorFs) OpenFile(name string, flag int, perm os.FileMode) (afero.File, error) {
+	f, err := fs.Fs.OpenFile(name, flag, perm)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %q: %w", name, err)
+	}
+	return closeErrorFile{File: f, closeErr: fs.closeErr}, nil
+}
+
+type closeErrorFile struct {
+	afero.File
+	closeErr error
+}
+
+// Close implements afero.File
+func (f closeErrorFile) Close() error {
+	_ = f.File.Close()
+	return f.closeErr
+}
 
 var _ Builder = fakeBuilder{}
 
@@ -429,6 +616,7 @@ var _ Builder = fakeBuilder{}
 type fakeBuilder struct {
 	path           string
 	ifExistsAction IfExistsAction
+	TestField      string // test go template actions
 }
 
 // GetPath implements Builder
@@ -455,23 +643,34 @@ func (f fakeRequiresValidation) Validate() error {
 	return f.validateErr
 }
 
-var _ Template = fakeTemplate{}
+var _ Template = &fakeTemplate{}
 
 // fakeTemplate is used to mock a File in order to test Scaffold
 type fakeTemplate struct {
 	fakeBuilder
 
-	body string
-	err  error
+	body            string
+	err             error
+	parseDelimLeft  string
+	parseDelimRight string
+}
+
+func (f *fakeTemplate) SetDelim(left, right string) {
+	f.parseDelimLeft = left
+	f.parseDelimRight = right
+}
+
+func (f *fakeTemplate) GetDelim() (string, string) {
+	return f.parseDelimLeft, f.parseDelimRight
 }
 
 // GetBody implements Template
-func (f fakeTemplate) GetBody() string {
+func (f *fakeTemplate) GetBody() string {
 	return f.body
 }
 
 // SetTemplateDefaults implements Template
-func (f fakeTemplate) SetTemplateDefaults() error {
+func (f *fakeTemplate) SetTemplateDefaults() error {
 	if f.err != nil {
 		return f.err
 	}
@@ -502,4 +701,18 @@ func (f fakeInserter) GetMarkers() []Marker {
 // GetCodeFragments implements Inserter
 func (f fakeInserter) GetCodeFragments() CodeFragmentsMap {
 	return f.codeFragments
+}
+
+var (
+	_ Inserter             = fakeInserterWithIfNotExists{}
+	_ HasIfNotExistsAction = fakeInserterWithIfNotExists{}
+)
+
+type fakeInserterWithIfNotExists struct {
+	fakeInserter
+	ifNotExistsAction IfNotExistsAction
+}
+
+func (f fakeInserterWithIfNotExists) GetIfNotExistsAction() IfNotExistsAction {
+	return f.ifNotExistsAction
 }

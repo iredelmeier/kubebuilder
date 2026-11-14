@@ -20,15 +20,19 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/config/store"
-	yamlstore "sigs.k8s.io/kubebuilder/v3/pkg/config/store/yaml"
-	"sigs.k8s.io/kubebuilder/v3/pkg/machinery"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
-	"sigs.k8s.io/kubebuilder/v3/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config/store"
+	yamlstore "sigs.k8s.io/kubebuilder/v4/pkg/config/store/yaml"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/external"
 )
 
 // noResolvedPluginError is returned by subcommands that require a plugin when none was resolved.
@@ -63,50 +67,77 @@ func errCmdFunc(err error) func(*cobra.Command, []string) error {
 	}
 }
 
-// keySubcommandTuple represents a pairing of the key of a plugin with a plugin.Subcommand.
+// keySubcommandTuple pairs a plugin key with its subcommand.
+// key is the plugin's own key, configKey is the bundle key (if wrapped in a bundle).
 type keySubcommandTuple struct {
 	key        string
+	configKey  string
 	subcommand plugin.Subcommand
 
-	// skip will be used to flag subcommands that should be skipped after any hook returned a plugin.ExitError.
+	// skip marks subcommands that should be skipped after a plugin.ExitError.
 	skip bool
 }
 
-// filterSubcommands returns a list of plugin keys and subcommands from a filtered list of resolved plugins.
+type pluginChainSetter interface {
+	SetPluginChain([]string)
+}
+
+// filterSubcommands returns plugin keys and subcommands from resolved plugins.
 func (c *CLI) filterSubcommands(
 	filter func(plugin.Plugin) bool,
 	extract func(plugin.Plugin) plugin.Subcommand,
 ) []keySubcommandTuple {
-	// Unbundle plugins
-	plugins := make([]plugin.Plugin, 0, len(c.resolvedPlugins))
+	tuples := make([]keySubcommandTuple, 0, len(c.resolvedPlugins))
 	for _, p := range c.resolvedPlugins {
-		if bundle, isBundle := p.(plugin.Bundle); isBundle {
-			plugins = append(plugins, bundle.Plugins()...)
-		} else {
-			plugins = append(plugins, p)
-		}
-	}
-
-	tuples := make([]keySubcommandTuple, 0, len(plugins))
-	for _, p := range plugins {
-		if filter(p) {
-			tuples = append(tuples, keySubcommandTuple{
-				key:        plugin.KeyFor(p),
-				subcommand: extract(p),
-			})
-		}
+		tuples = append(tuples, collectSubcommands(p, plugin.KeyFor(p), filter, extract)...)
 	}
 	return tuples
 }
 
-// applySubcommandHooks runs the initialization hooks and configures the commands pre-run,
-// run, and post-run hooks with the appropriate execution hooks.
+func collectSubcommands(
+	p plugin.Plugin,
+	configKey string,
+	filter func(plugin.Plugin) bool,
+	extract func(plugin.Plugin) plugin.Subcommand,
+) []keySubcommandTuple {
+	if bundle, isBundle := p.(plugin.Bundle); isBundle {
+		collected := make([]keySubcommandTuple, 0, len(bundle.Plugins()))
+		for _, nested := range bundle.Plugins() {
+			collected = append(collected, collectSubcommands(nested, configKey, filter, extract)...)
+		}
+		return collected
+	}
+
+	if !filter(p) {
+		return nil
+	}
+
+	return []keySubcommandTuple{{
+		key:        plugin.KeyFor(p),
+		configKey:  configKey,
+		subcommand: extract(p),
+	}}
+}
+
+// applySubcommandHooks runs the initialization hooks and wires pre-run, run, and post-run for the command.
+// Used by init, create api, create webhook, and edit. When several plugins define the same flag,
+// one flag is shown and its value is synced to all plugins after parse.
 func (c *CLI) applySubcommandHooks(
 	cmd *cobra.Command,
 	subcommands []keySubcommandTuple,
 	errorMessage string,
 	createConfig bool,
 ) {
+	commandPluginChain := make([]string, len(subcommands))
+	for i, tuple := range subcommands {
+		commandPluginChain[i] = tuple.key
+	}
+	for _, tuple := range subcommands {
+		if setter, ok := tuple.subcommand.(pluginChainSetter); ok {
+			setter.SetPluginChain(commandPluginChain)
+		}
+	}
+
 	// In case we create a new project configuration we need to compute the plugin chain.
 	pluginChain := make([]string, 0, len(c.resolvedPlugins))
 	if createConfig {
@@ -117,27 +148,135 @@ func (c *CLI) applySubcommandHooks(
 		}
 	}
 
-	options := initializationHooks(cmd, subcommands, c.metadata())
+	showPluginPrefix := c.shouldShowPluginPrefix(c.args)
+	result, err := initializationHooks(cmd, subcommands, c.metadata(), showPluginPrefix)
+	if err != nil {
+		cmdErr(cmd, err)
+		return
+	}
 
 	factory := executionHooksFactory{
-		fs:             c.fs,
-		store:          yamlstore.New(c.fs),
-		subcommands:    subcommands,
-		errorMessage:   errorMessage,
-		projectVersion: c.projectVersion,
-		pluginChain:    pluginChain,
+		fs:                  c.fs,
+		store:               yamlstore.New(c.fs),
+		subcommands:         subcommands,
+		errorMessage:        errorMessage,
+		projectVersion:      c.projectVersion,
+		pluginChain:         pluginChain,
+		cliVersion:          c.cliVersion,
+		duplicateFlagValues: result.duplicateFlagValues,
 	}
-	cmd.PreRunE = factory.preRunEFunc(options, createConfig)
+	cmd.PreRunE = factory.preRunEFunc(result.options, createConfig)
 	cmd.RunE = factory.runEFunc()
 	cmd.PostRunE = factory.postRunEFunc()
 }
 
-// initializationHooks executes update metadata and bind flags plugin hooks.
+// appendPluginTable appends a filtered plugin table to the command's Long description.
+// For subcommands, it excludes the default scaffold and its component plugins.
+func (c *CLI) appendPluginTable(cmd *cobra.Command, filter func(plugin.Plugin) bool, title string) {
+	pluginTable := c.getPluginTableFilteredForSubcommand(filter)
+	cmd.Long = fmt.Sprintf("%s\n%s:\n\n%s\n", cmd.Long, title, pluginTable)
+}
+
+// shouldShowPluginPrefix returns true if the plugin prefix should be shown in help output.
+// The prefix is shown if the user explicitly requested it via the --plugins flag, or if
+// any of the resolved plugins is an external plugin.
+func (c *CLI) shouldShowPluginPrefix(args []string) bool {
+	if slices.ContainsFunc(args, isPluginsFlag) {
+		return true
+	}
+	return slices.ContainsFunc(c.resolvedPlugins, func(p plugin.Plugin) bool {
+		_, isExternal := p.(external.Plugin)
+		return isExternal
+	})
+}
+
+// initHooksResult holds the result of initializationHooks: resource options and
+// duplicate-flag values to sync after parse.
+type initHooksResult struct {
+	options             *resourceOptions
+	duplicateFlagValues map[string][]pflag.Value
+}
+
+// mergeFlagSetInto merges flags from src into dest using AddFlagSet. If a flag name already exists,
+// the flag is not added again; its Value is stored in duplicateValues for later sync and the existing
+// Usage is extended. Returns an error if the same flag name is used with a different value type.
+func mergeFlagSetInto(
+	dest *pflag.FlagSet,
+	src *pflag.FlagSet,
+	duplicateValues map[string][]pflag.Value,
+	pluginKey string,
+	firstPluginByFlag map[string]string,
+	showPluginPrefix bool,
+) error {
+	destNames := make(map[string]struct{})
+	dest.VisitAll(func(f *pflag.Flag) {
+		destNames[f.Name] = struct{}{}
+	})
+	dest.AddFlagSet(src)
+
+	var err error
+	src.VisitAll(func(flag *pflag.Flag) {
+		if err != nil {
+			return
+		}
+		existing := dest.Lookup(flag.Name)
+		if _, wasInDest := destNames[flag.Name]; !wasInDest {
+			firstPluginByFlag[flag.Name] = pluginKey
+			if showPluginPrefix {
+				existing.Usage = "For plugin (" + pluginKey + "): " + strings.TrimSpace(flag.Usage)
+			} else {
+				existing.Usage = strings.TrimSpace(flag.Usage)
+			}
+			return
+		}
+		if existing.Value.Type() != flag.Value.Type() {
+			firstKey := firstPluginByFlag[flag.Name]
+			err = fmt.Errorf(
+				"plugins %q and %q use the same flag name %q but expect different value types: one %s, other %s",
+				firstKey, pluginKey, flag.Name, existing.Value.Type(), flag.Value.Type(),
+			)
+			return
+		}
+		duplicateValues[flag.Name] = append(duplicateValues[flag.Name], flag.Value)
+
+		if !showPluginPrefix && len(duplicateValues[flag.Name]) == 1 {
+			// This is the first time we realize the flag is duplicated. We must rewrite the
+			// first plugin's usage to include its prefix for disambiguation.
+			firstKey := firstPluginByFlag[flag.Name]
+			if firstKey != "" {
+				existing.Usage = "For plugin (" + firstKey + "): " + existing.Usage
+			}
+		}
+
+		existing.Usage += " AND for plugin (" + pluginKey + "): " + strings.TrimSpace(flag.Usage)
+	})
+	return err
+}
+
+// syncDuplicateFlags copies the parsed value of each flag to all duplicate Values from merge.
+// Call after the command has parsed flags (e.g. at the start of PreRunE).
+func syncDuplicateFlags(flags *pflag.FlagSet, duplicateValues map[string][]pflag.Value) {
+	for name, values := range duplicateValues {
+		parsed := flags.Lookup(name)
+		if parsed == nil {
+			continue
+		}
+		srcVal := parsed.Value.String()
+		for _, v := range values {
+			_ = v.Set(srcVal)
+		}
+	}
+}
+
+// initializationHooks runs update-metadata and bind-flags hooks. When multiple plugins bind the same
+// flag, one flag is used and its value is synced to all after parse; usage text is aggregated.
+// Returns an error if the same flag name is used with different value types (e.g. bool vs string).
 func initializationHooks(
 	cmd *cobra.Command,
 	subcommands []keySubcommandTuple,
 	meta plugin.CLIMetadata,
-) *resourceOptions {
+	showPluginPrefix bool,
+) (*initHooksResult, error) {
 	// Update metadata hook.
 	subcmdMeta := plugin.SubcommandMetadata{
 		Description: cmd.Long,
@@ -161,16 +300,43 @@ func initializationHooks(
 	var options *resourceOptions
 	if requiresResource {
 		options = bindResourceFlags(cmd.Flags())
-	}
-
-	// Bind flags hook.
-	for _, tuple := range subcommands {
-		if subcommand, hasFlags := tuple.subcommand.(plugin.HasFlags); hasFlags {
-			subcommand.BindFlags(cmd.Flags())
+		if err := cmd.MarkFlagRequired("version"); err != nil {
+			return nil, fmt.Errorf("failed to mark 'version' flag as required: %w", err)
+		}
+		if err := cmd.MarkFlagRequired("kind"); err != nil {
+			return nil, fmt.Errorf("failed to mark 'kind' flag as required: %w", err)
 		}
 	}
 
-	return options
+	// Bind flags hook: each plugin binds to a temporary FlagSet, then we merge into the command so
+	// duplicate names do not panic; values are synced after parse and help text is aggregated.
+	duplicateValues := make(map[string][]pflag.Value)
+	firstPluginByFlag := make(map[string]string)
+
+	type pluginFlagSet struct {
+		key   string
+		flags *pflag.FlagSet
+	}
+	var flagSets []pluginFlagSet
+
+	for _, tuple := range subcommands {
+		if subcommand, hasFlags := tuple.subcommand.(plugin.HasFlags); hasFlags {
+			tmpSet := pflag.NewFlagSet(cmd.Name(), pflag.ExitOnError)
+			subcommand.BindFlags(tmpSet)
+			if tmpSet.HasFlags() {
+				flagSets = append(flagSets, pluginFlagSet{key: tuple.key, flags: tmpSet})
+			}
+		}
+	}
+
+	for _, pfs := range flagSets {
+		err := mergeFlagSetInto(cmd.Flags(), pfs.flags, duplicateValues, pfs.key, firstPluginByFlag, showPluginPrefix)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &initHooksResult{options: options, duplicateFlagValues: duplicateValues}, nil
 }
 
 type executionHooksFactory struct {
@@ -187,6 +353,10 @@ type executionHooksFactory struct {
 	projectVersion config.Version
 	// pluginChain is the plugin chain configured for this project.
 	pluginChain []string
+	// cliVersion is the version of the CLI.
+	cliVersion string
+	// duplicateFlagValues maps flag names to Values to sync from the parsed flag in PreRunE.
+	duplicateFlagValues map[string][]pflag.Value
 }
 
 func (factory *executionHooksFactory) forEach(cb func(subcommand plugin.Subcommand) error, errorMessage string) error {
@@ -195,7 +365,9 @@ func (factory *executionHooksFactory) forEach(cb func(subcommand plugin.Subcomma
 			continue
 		}
 
-		err := cb(tuple.subcommand)
+		err := factory.withPluginChain(tuple, func() error {
+			return cb(tuple.subcommand)
+		})
 
 		var exitError plugin.ExitError
 		switch {
@@ -214,13 +386,77 @@ func (factory *executionHooksFactory) forEach(cb func(subcommand plugin.Subcomma
 	return nil
 }
 
+func (factory *executionHooksFactory) withPluginChain(tuple keySubcommandTuple, cb func() error) (err error) {
+	if tuple.configKey == "" {
+		return cb()
+	}
+
+	cfg := factory.store.Config()
+	if cfg == nil {
+		return cb()
+	}
+
+	// Temporarily move configKey to the front so GetPluginKeyForConfig finds it first.
+	// This ensures each bundled plugin saves config under the right key.
+	original := append([]string(nil), cfg.GetPluginChain()...)
+	newChain := moveKeyToFront(original, tuple.configKey)
+	changed := !equalStringSlices(original, newChain)
+	if changed {
+		if setErr := cfg.SetPluginChain(newChain); setErr != nil {
+			return fmt.Errorf("failed to set plugin chain for %q: %w", tuple.configKey, setErr)
+		}
+		defer func() {
+			if resetErr := cfg.SetPluginChain(original); resetErr != nil && err == nil {
+				err = fmt.Errorf("failed to reset plugin chain: %w", resetErr)
+			}
+		}()
+	}
+
+	return cb()
+}
+
+func moveKeyToFront(chain []string, key string) []string {
+	if len(chain) == 0 {
+		return []string{key}
+	}
+
+	if chain[0] == key {
+		return chain
+	}
+
+	newChain := make([]string, 0, len(chain)+1)
+	newChain = append(newChain, key)
+	for _, existing := range chain {
+		if existing == key {
+			continue
+		}
+		newChain = append(newChain, existing)
+	}
+	return newChain
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // preRunEFunc returns a cobra RunE function that loads the configuration, creates the resource,
 // and executes inject config, inject resource, and pre-scaffold hooks.
 func (factory *executionHooksFactory) preRunEFunc(
 	options *resourceOptions,
 	createConfig bool,
 ) func(*cobra.Command, []string) error {
-	return func(*cobra.Command, []string) error {
+	return func(cmd *cobra.Command, _ []string) error {
+		if len(factory.duplicateFlagValues) > 0 {
+			syncDuplicateFlags(cmd.Flags(), factory.duplicateFlagValues)
+		}
 		if createConfig {
 			// Check if a project configuration is already present.
 			if err := factory.store.Load(); err == nil || !errors.Is(err, os.ErrNotExist) {
@@ -233,14 +469,25 @@ func (factory *executionHooksFactory) preRunEFunc(
 			}
 		} else {
 			// Load the project configuration.
-			if err := factory.store.Load(); os.IsNotExist(err) {
-				return fmt.Errorf("%s: unable to find configuration file, project must be initialized",
+			if err := factory.store.Load(); errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%s: failed to find configuration file, project must be initialized",
 					factory.errorMessage)
 			} else if err != nil {
-				return fmt.Errorf("%s: unable to load configuration file: %w", factory.errorMessage, err)
+				return fmt.Errorf("%s: failed to load configuration file: %w", factory.errorMessage, err)
+			}
+
+			// The command saves the configuration after scaffolding, and a save migrates every resource.
+			// Refuse a configuration that cannot be saved before any plugin writes a file.
+			if _, err := factory.store.Config().MarshalYAML(); err != nil {
+				return fmt.Errorf("%s: the configuration file cannot be saved: %w", factory.errorMessage, err)
 			}
 		}
 		cfg := factory.store.Config()
+
+		// Set the CLI version if creating a new project configuration.
+		if createConfig {
+			_ = cfg.SetCliVersion(factory.cliVersion)
+		}
 
 		// Set the pluginChain field.
 		if len(factory.pluginChain) != 0 {
@@ -250,10 +497,11 @@ func (factory *executionHooksFactory) preRunEFunc(
 		// Create the resource if non-nil options provided
 		var res *resource.Resource
 		if options != nil {
-			// TODO: offer a flag instead of hard-coding project-wide domain
+			// TODO: offer a --domain flag so a fresh resource can set it directly.
 			options.Domain = cfg.GetDomain()
+			options.Domain = options.resolveDomain(cfg)
 			if err := options.validate(); err != nil {
-				return fmt.Errorf("%s: unable to create resource: %w", factory.errorMessage, err)
+				return fmt.Errorf("%s: failed to create resource: %w", factory.errorMessage, err)
 			}
 			res = options.newResource()
 		}
@@ -285,6 +533,7 @@ func (factory *executionHooksFactory) preRunEFunc(
 		}
 
 		// Pre-scaffold hook.
+		//nolint:revive
 		if err := factory.forEach(func(subcommand plugin.Subcommand) error {
 			if subcommand, hasPreScaffold := subcommand.(plugin.HasPreScaffold); hasPreScaffold {
 				return subcommand.PreScaffold(factory.fs)
@@ -302,6 +551,7 @@ func (factory *executionHooksFactory) preRunEFunc(
 func (factory *executionHooksFactory) runEFunc() func(*cobra.Command, []string) error {
 	return func(*cobra.Command, []string) error {
 		// Scaffold hook.
+		//nolint:revive
 		if err := factory.forEach(func(subcommand plugin.Subcommand) error {
 			return subcommand.Scaffold(factory.fs)
 		}, "unable to scaffold with"); err != nil {
@@ -317,10 +567,11 @@ func (factory *executionHooksFactory) runEFunc() func(*cobra.Command, []string) 
 func (factory *executionHooksFactory) postRunEFunc() func(*cobra.Command, []string) error {
 	return func(*cobra.Command, []string) error {
 		if err := factory.store.Save(); err != nil {
-			return fmt.Errorf("%s: unable to save configuration file: %w", factory.errorMessage, err)
+			return fmt.Errorf("%s: failed to save configuration file: %w", factory.errorMessage, err)
 		}
 
 		// Post-scaffold hook.
+		//nolint:revive
 		if err := factory.forEach(func(subcommand plugin.Subcommand) error {
 			if subcommand, hasPostScaffold := subcommand.(plugin.HasPostScaffold); hasPostScaffold {
 				return subcommand.PostScaffold()

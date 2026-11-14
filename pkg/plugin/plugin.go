@@ -17,7 +17,7 @@ limitations under the License.
 package plugin
 
 import (
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
 )
 
 // Plugin is an interface that defines the common base for all plugins.
@@ -39,6 +39,13 @@ type Plugin interface {
 type Deprecated interface {
 	// DeprecationWarning returns a string indicating a plugin is deprecated.
 	DeprecationWarning() string
+}
+
+// Describable is an optional interface for plugins that provide a short description.
+// This description is shown in help output to explain what the plugin does.
+type Describable interface {
+	// Description returns a short description of the plugin (ideally one line).
+	Description() string
 }
 
 // Init is an interface for plugins that provide an `init` subcommand.

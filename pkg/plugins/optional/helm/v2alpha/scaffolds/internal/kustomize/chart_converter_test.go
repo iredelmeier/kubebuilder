@@ -1,0 +1,901 @@
+/*
+Copyright 2025 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package kustomize
+
+import (
+	"path/filepath"
+
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	"github.com/spf13/afero"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugins/optional/helm/v2alpha/scaffolds/internal/extractor"
+)
+
+const (
+	testContainerNameManager          = "manager"
+	testContainerImageController      = "controller:latest"
+	testYAMLFieldName                 = "name"
+	testYAMLFieldImage                = "image"
+	testYAMLFieldArgs                 = "args"
+	testYAMLFieldSecretName           = "secretName"
+	testYAMLFieldPorts                = "ports"
+	testYAMLFieldMountPath            = "mountPath"
+	testYAMLFieldReadOnly             = "readOnly"
+	testYAMLFieldSecret               = "secret"
+	testSecretNameApp                 = "app-secret"
+	testYAMLFieldNamespace            = "namespace"
+	testYAMLFieldLabels               = "labels"
+	testLabelAppKubernetesIOName      = "app.kubernetes.io/name"
+	testLabelAppKubernetesIOManagedBy = "app.kubernetes.io/managed-by"
+	testProjectName                   = "test-project"
+	testNamespaceTestSystem           = "test-system"
+	testNamespaceTestProjectSystem    = "test-project-system"
+	testManagedByKustomize            = "kustomize"
+	testWebhookCertsVolume            = "webhook-certs"
+)
+
+func extractDeploymentConfig(deployment *unstructured.Unstructured) map[string]any {
+	de := extractor.DeploymentExtractor{}
+	cfg, err := de.ExtractDeploymentConfig(deployment)
+	Expect(err).NotTo(HaveOccurred())
+	return convertValuesConfigToMap(cfg)
+}
+
+var _ = Describe("ChartConverter", func() {
+	var (
+		converter *ChartConverter
+		resources *ParsedResources
+		fs        machinery.Filesystem
+	)
+
+	BeforeEach(func() {
+		// Create test resources
+		resources = &ParsedResources{}
+
+		// Add a test deployment
+		deployment := &unstructured.Unstructured{}
+		deployment.SetAPIVersion("apps/v1")
+		deployment.SetKind("Deployment")
+		deployment.SetName("test-controller")
+		deployment.SetNamespace(testNamespaceTestSystem)
+
+		// Set deployment spec
+		err := unstructured.SetNestedField(deployment.Object, int64(1), "spec", "replicas")
+		Expect(err).NotTo(HaveOccurred())
+
+		resources.Deployment = deployment
+
+		// Create filesystem
+		fs = machinery.Filesystem{FS: afero.NewMemMapFs()}
+
+		// Create converter
+		converter = NewChartConverter(
+			resources, testProjectName, testProjectName, testNamespaceTestSystem, "dist", make(map[string]string),
+		)
+	})
+
+	Context("NewChartConverter", func() {
+		It("should create a converter with correct properties", func() {
+			Expect(converter.resources).To(Equal(resources))
+			Expect(converter.detectedPrefix).To(Equal(testProjectName))
+			Expect(converter.outputDir).To(Equal("dist"))
+		})
+	})
+
+	Context("WriteChartFiles", func() {
+		It("should write chart files to filesystem", func() {
+			// Add some resources to test with
+			serviceAccount := &unstructured.Unstructured{}
+			serviceAccount.SetAPIVersion("v1")
+			serviceAccount.SetKind("ServiceAccount")
+			serviceAccount.SetName("test-sa")
+			serviceAccount.SetNamespace(testNamespaceTestSystem)
+			resources.ServiceAccount = serviceAccount
+
+			// Add RBAC resources to test rbac directory creation
+			clusterRole := &unstructured.Unstructured{}
+			clusterRole.SetAPIVersion("rbac.authorization.k8s.io/v1")
+			clusterRole.SetKind("ClusterRole")
+			clusterRole.SetName("test-role")
+			resources.ClusterRoles = []*unstructured.Unstructured{clusterRole}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			exists, err := afero.Exists(fs.FS, "dist/chart/templates/manager")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+
+			exists, err = afero.Exists(fs.FS, "dist/chart/templates/rbac")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+		})
+
+		It("should deduplicate identical resources within a group", func() {
+			// Prepare two identical Services in the metrics group
+			metricsSvc1 := &unstructured.Unstructured{}
+			metricsSvc1.SetAPIVersion("v1")
+			metricsSvc1.SetKind("Service")
+			metricsSvc1.SetName("test-project-controller-manager-metrics-service")
+			metricsSvc1.SetNamespace(testNamespaceTestSystem)
+
+			metricsSvc2 := &unstructured.Unstructured{}
+			metricsSvc2.SetAPIVersion("v1")
+			metricsSvc2.SetKind("Service")
+			metricsSvc2.SetName("test-project-controller-manager-metrics-service")
+			metricsSvc2.SetNamespace(testNamespaceTestSystem)
+
+			// Add both to resources; organizer will place them into the metrics group
+			resources.Services = append(resources.Services, metricsSvc1, metricsSvc2)
+
+			// Write chart files
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Expect only one file to be written for the metrics service after de-duplication
+			metricsDir := filepath.Join("dist", "chart", "templates", "metrics")
+			files, err := afero.ReadDir(fs.FS, metricsDir)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1), "expected only one metrics service file after deduplication")
+		})
+	})
+
+	Context("kustomize-derived templates regenerate", func() {
+		It("always regenerates kustomize-provided templates to match the source", func() {
+			networkPolicy := &unstructured.Unstructured{}
+			networkPolicy.SetAPIVersion("networking.k8s.io/v1")
+			networkPolicy.SetKind("NetworkPolicy")
+			networkPolicy.SetName("test-project-allow-metrics-traffic")
+			resources.NetworkPolicies = []*unstructured.Unstructured{networkPolicy}
+
+			serviceMonitor := &unstructured.Unstructured{}
+			serviceMonitor.SetAPIVersion("monitoring.coreos.com/v1")
+			serviceMonitor.SetKind("ServiceMonitor")
+			serviceMonitor.SetName("test-project-controller-manager-metrics-monitor")
+			resources.ServiceMonitors = []*unstructured.Unstructured{serviceMonitor}
+
+			builders := converter.GetChartBuilders()
+
+			for _, b := range builders {
+				dynamicTemplate, ok := b.(*DynamicTemplate)
+				Expect(ok).To(BeTrue())
+				Expect(dynamicTemplate.SetTemplateDefaults()).To(Succeed())
+				Expect(dynamicTemplate.IfExistsAction).To(Equal(machinery.OverwriteFile),
+					"kustomize-derived template %q must always regenerate", dynamicTemplate.RelativePath)
+			}
+		})
+	})
+
+	Context("ExtractDeploymentConfig", func() {
+		It("should extract deployment configuration correctly", func() {
+			// Set up deployment with environment variables
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+					"imagePullPolicy":  "IfNotPresent",
+					testYAMLFieldArgs: []any{
+						"--metrics-bind-address=:8443",
+						"--metrics-secure=false",
+						"--leader-elect",
+						"--custom-flag=value",
+						"--health-probe-bind-address=:8081",
+						"--webhook-port=9443",
+						"--webhook-cert-path=/tmp/k8s-webhook-server/serving-certs",
+					},
+					"env": []any{
+						map[string]any{
+							testYAMLFieldName: "TEST_ENV",
+							"value":           "test-value",
+						},
+					},
+					"resources": map[string]any{
+						"limits": map[string]any{
+							"cpu":    "100m",
+							"memory": "128Mi",
+						},
+					},
+				},
+			}
+
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).NotTo(BeNil())
+			Expect(config).To(HaveKey("env"))
+			Expect(config).To(HaveKey(testYAMLFieldImage))
+			Expect(config).To(HaveKey("resources"))
+			Expect(config).To(HaveKey(testYAMLFieldArgs))
+
+			imageConfig, ok := config[testYAMLFieldImage].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(imageConfig["repository"]).To(Equal("controller"))
+			Expect(imageConfig["tag"]).To(Equal("latest"))
+			Expect(imageConfig["pullPolicy"]).To(Equal("IfNotPresent"))
+
+			args, ok := config[testYAMLFieldArgs].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(args).To(ContainElement("--leader-elect"))
+			Expect(args).To(ContainElement("--custom-flag=value"))
+			Expect(args).NotTo(ContainElement("--metrics-bind-address=:8443"))
+			Expect(args).NotTo(ContainElement("--metrics-secure=false"))
+			Expect(args).NotTo(ContainElement("--health-probe-bind-address=:8081"))
+			Expect(args).NotTo(ContainElement("--webhook-port=9443"))
+		})
+
+		It("should extract port configurations from args", func() {
+			// Set up deployment with port-related args
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+					testYAMLFieldArgs: []any{
+						"--metrics-bind-address=:8443",
+						"--health-probe-bind-address=:8081",
+						"--leader-elect",
+					},
+				},
+			}
+
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("metricsPort"))
+			Expect(config["metricsPort"]).To(Equal(8443))
+			Expect(config).NotTo(HaveKey("healthPort"))
+		})
+
+		It("should extract webhook port from container ports", func() {
+			// Set up deployment with webhook container port
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+					testYAMLFieldPorts: []any{
+						map[string]any{
+							"containerPort":   int64(9443),
+							testYAMLFieldName: "webhook-server",
+							"protocol":        "TCP",
+						},
+					},
+				},
+			}
+
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("webhookPort"))
+			Expect(config["webhookPort"]).To(Equal(9443))
+		})
+
+		It("should extract custom port values", func() {
+			// Set up deployment with custom ports
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+					testYAMLFieldArgs: []any{
+						"--metrics-bind-address=:9090",
+						"--health-probe-bind-address=:9091",
+					},
+					testYAMLFieldPorts: []any{
+						map[string]any{
+							"containerPort":   int64(9444),
+							testYAMLFieldName: "webhook-server",
+							"protocol":        "TCP",
+						},
+					},
+				},
+			}
+
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config["metricsPort"]).To(Equal(9090))
+			Expect(config["healthPort"]).To(BeNil())
+			Expect(config["webhookPort"]).To(Equal(9444))
+		})
+
+		It("should extract imagePullSecrets", func() {
+			// Set up deployment with image pull secrets
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+				},
+			}
+			imagePullSecrets := []any{
+				map[string]any{
+					testYAMLFieldName: "test-secret",
+				},
+			}
+			// Set the image pull secrets
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				imagePullSecrets,
+				"spec", "template", "spec", "imagePullSecrets",
+			)
+			Expect(err).NotTo(HaveOccurred())
+			// Set the containers
+			err = unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+			Expect(config).To(HaveKey("imagePullSecrets"))
+			Expect(config["imagePullSecrets"]).To(Equal(imagePullSecrets))
+		})
+
+		It("should handle deployment without containers", func() {
+			config := extractDeploymentConfig(resources.Deployment)
+			// Should still extract deployment-level fields (replicas, strategy) even without containers
+			Expect(config).To(HaveKey("replicas"))
+			Expect(config["replicas"]).To(Equal(1))
+
+			// But should not have container-level fields (env, args, resources, etc.)
+			Expect(config).NotTo(HaveKey("env"))
+			Expect(config).NotTo(HaveKey(testYAMLFieldArgs))
+			Expect(config).NotTo(HaveKey("resources"))
+			Expect(config).NotTo(HaveKey(testYAMLFieldImage))
+		})
+
+		It("should extract extraVolumes and extraVolumeMounts excluding webhook and metrics", func() {
+			volumes := []any{
+				map[string]any{
+					testYAMLFieldName:   testWebhookCertsVolume,
+					testYAMLFieldSecret: map[string]any{testYAMLFieldSecretName: "webhook-server-cert"},
+				},
+				map[string]any{
+					testYAMLFieldName:   "custom-volume",
+					testYAMLFieldSecret: map[string]any{testYAMLFieldSecretName: "my-secret"},
+				},
+			}
+			volumeMounts := []any{
+				map[string]any{
+					testYAMLFieldName:      testWebhookCertsVolume,
+					testYAMLFieldMountPath: "/tmp/k8s-webhook-server/serving-certs",
+					testYAMLFieldReadOnly:  true,
+				},
+				map[string]any{
+					testYAMLFieldName:      "custom-volume",
+					testYAMLFieldMountPath: "/etc/my-secrets",
+					testYAMLFieldReadOnly:  true,
+				},
+			}
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName:  testContainerNameManager,
+					testYAMLFieldImage: testContainerImageController,
+					"volumeMounts":     volumeMounts,
+				},
+			}
+			err := unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				volumes,
+				"spec", "template", "spec", "volumes",
+			)
+			Expect(err).NotTo(HaveOccurred())
+			err = unstructured.SetNestedSlice(
+				resources.Deployment.Object,
+				containers,
+				"spec", "template", "spec", "containers",
+			)
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("extraVolumes"))
+			extraVols, ok := config["extraVolumes"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(extraVols).To(HaveLen(1))
+			Expect(extraVols[0]).To(HaveKeyWithValue("name", "custom-volume"))
+
+			Expect(config).To(HaveKey("extraVolumeMounts"))
+			extraMounts, ok := config["extraVolumeMounts"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(extraMounts).To(HaveLen(1))
+			Expect(extraMounts[0]).To(HaveKeyWithValue(testYAMLFieldMountPath, "/etc/my-secrets"))
+		})
+
+		It("should not add webhook-certs or metrics-certs to extraVolumes or extraVolumeMounts", func() {
+			volumes := []any{
+				map[string]any{
+					testYAMLFieldName:   testWebhookCertsVolume,
+					testYAMLFieldSecret: map[string]any{testYAMLFieldSecretName: "webhook-server-cert"},
+				},
+				map[string]any{
+					testYAMLFieldName:   "metrics-certs",
+					testYAMLFieldSecret: map[string]any{testYAMLFieldSecretName: "metrics-server-cert"},
+				},
+				map[string]any{
+					testYAMLFieldName:   testSecretNameApp,
+					testYAMLFieldSecret: map[string]any{testYAMLFieldSecretName: testSecretNameApp},
+				},
+			}
+			volumeMounts := []any{
+				map[string]any{
+					testYAMLFieldName: testWebhookCertsVolume, testYAMLFieldMountPath: "/tmp/webhook",
+					testYAMLFieldReadOnly: true,
+				},
+				map[string]any{
+					testYAMLFieldName: "metrics-certs", testYAMLFieldMountPath: "/tmp/metrics",
+					testYAMLFieldReadOnly: true,
+				},
+				map[string]any{
+					testYAMLFieldName: testSecretNameApp, testYAMLFieldMountPath: "/etc/app",
+					testYAMLFieldReadOnly: true,
+				},
+			}
+			containers := []any{
+				map[string]any{
+					testYAMLFieldName: testContainerNameManager, testYAMLFieldImage: testContainerImageController,
+					"volumeMounts": volumeMounts,
+				},
+			}
+			err := unstructured.SetNestedSlice(resources.Deployment.Object, volumes, "spec", "template", "spec", "volumes")
+			Expect(err).NotTo(HaveOccurred())
+			err = unstructured.SetNestedSlice(resources.Deployment.Object, containers, "spec", "template", "spec", "containers")
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			extraVols, ok := config["extraVolumes"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(extraVols).To(HaveLen(1))
+			Expect(extraVols[0]).To(HaveKeyWithValue("name", testSecretNameApp))
+			extraMounts, ok := config["extraVolumeMounts"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(extraMounts).To(HaveLen(1))
+			Expect(extraMounts[0]).To(HaveKeyWithValue("name", testSecretNameApp))
+		})
+
+		It("should extract deployment replicas", func() {
+			// replicas is set in BeforeEach to 1
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("replicas"))
+			Expect(config["replicas"]).To(Equal(1))
+		})
+
+		It("should extract deployment strategy", func() {
+			// Set up deployment with strategy
+			strategy := map[string]any{
+				"type": "RollingUpdate",
+				"rollingUpdate": map[string]any{
+					"maxSurge":       "25%",
+					"maxUnavailable": "25%",
+				},
+			}
+			err := unstructured.SetNestedField(resources.Deployment.Object, strategy, "spec", "strategy")
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("strategy"))
+			strategyConfig, ok := config["strategy"].(map[string]any)
+			Expect(ok).To(BeTrue())
+			Expect(strategyConfig["type"]).To(Equal("RollingUpdate"))
+		})
+
+		It("should extract priorityClassName from pod spec", func() {
+			// Set up deployment with priorityClassName
+			containers := []any{
+				map[string]any{testYAMLFieldName: testContainerNameManager, testYAMLFieldImage: testContainerImageController},
+			}
+			err := unstructured.SetNestedSlice(resources.Deployment.Object, containers, "spec", "template", "spec", "containers")
+			Expect(err).NotTo(HaveOccurred())
+			err = unstructured.SetNestedField(
+				resources.Deployment.Object, "high-priority", "spec", "template", "spec", "priorityClassName")
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("priorityClassName"))
+			Expect(config["priorityClassName"]).To(Equal("high-priority"))
+		})
+
+		It("should extract topologySpreadConstraints from pod spec", func() {
+			// Set up deployment with topologySpreadConstraints
+			containers := []any{
+				map[string]any{testYAMLFieldName: testContainerNameManager, testYAMLFieldImage: testContainerImageController},
+			}
+			topologySpreadConstraints := []any{
+				map[string]any{
+					"maxSkew":           int64(1),
+					"topologyKey":       "kubernetes.io/hostname",
+					"whenUnsatisfiable": "DoNotSchedule",
+					"labelSelector": map[string]any{
+						"matchLabels": map[string]any{
+							"app": testContainerNameManager,
+						},
+					},
+				},
+			}
+			err := unstructured.SetNestedSlice(resources.Deployment.Object, containers, "spec", "template", "spec", "containers")
+			Expect(err).NotTo(HaveOccurred())
+			err = unstructured.SetNestedSlice(
+				resources.Deployment.Object, topologySpreadConstraints,
+				"spec", "template", "spec", "topologySpreadConstraints")
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("topologySpreadConstraints"))
+			tsc, ok := config["topologySpreadConstraints"].([]any)
+			Expect(ok).To(BeTrue())
+			Expect(tsc).To(HaveLen(1))
+		})
+
+		It("should extract terminationGracePeriodSeconds from pod spec", func() {
+			// Set up deployment with terminationGracePeriodSeconds
+			containers := []any{
+				map[string]any{testYAMLFieldName: testContainerNameManager, testYAMLFieldImage: testContainerImageController},
+			}
+			err := unstructured.SetNestedSlice(resources.Deployment.Object, containers, "spec", "template", "spec", "containers")
+			Expect(err).NotTo(HaveOccurred())
+			err = unstructured.SetNestedField(
+				resources.Deployment.Object, int64(30), "spec", "template", "spec", "terminationGracePeriodSeconds")
+			Expect(err).NotTo(HaveOccurred())
+
+			config := extractDeploymentConfig(resources.Deployment)
+
+			Expect(config).To(HaveKey("terminationGracePeriodSeconds"))
+			Expect(config["terminationGracePeriodSeconds"]).To(Equal(30))
+		})
+	})
+
+	Context("ExtractPortFromArg", func() {
+		It("should extract port from :PORT format", func() {
+			port := extractor.ExtractPortFromArg("--metrics-bind-address=:8443")
+			Expect(port).To(Equal(8443))
+		})
+
+		It("should extract port from 0.0.0.0:PORT format", func() {
+			port := extractor.ExtractPortFromArg("--metrics-bind-address=0.0.0.0:8443")
+			Expect(port).To(Equal(8443))
+		})
+
+		It("should extract port from HOST:PORT format", func() {
+			port := extractor.ExtractPortFromArg("--health-probe-bind-address=localhost:8081")
+			Expect(port).To(Equal(8081))
+		})
+
+		It("should return 0 for invalid formats", func() {
+			port := extractor.ExtractPortFromArg("--invalid-arg")
+			Expect(port).To(Equal(0))
+
+			port = extractor.ExtractPortFromArg("--no-equals:8443")
+			Expect(port).To(Equal(0))
+
+			port = extractor.ExtractPortFromArg("--port=invalid")
+			Expect(port).To(Equal(0))
+		})
+
+		It("should return 0 for out-of-range ports", func() {
+			port := extractor.ExtractPortFromArg("--port=:0")
+			Expect(port).To(Equal(0))
+
+			port = extractor.ExtractPortFromArg("--port=:99999")
+			Expect(port).To(Equal(0))
+		})
+	})
+
+	Context("Extras Directory", func() {
+		It("should place ConfigMap in extras directory", func() {
+			// Create a ConfigMap that doesn't fit standard categories
+			configMap := &unstructured.Unstructured{}
+			configMap.SetAPIVersion("v1")
+			configMap.SetKind("ConfigMap")
+			configMap.SetName("custom-config")
+			configMap.SetNamespace(testNamespaceTestSystem)
+			configMap.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "custom-config",
+				testYAMLFieldNamespace: testNamespaceTestSystem,
+				testYAMLFieldLabels: map[string]any{
+					testLabelAppKubernetesIOName:      testProjectName,
+					testLabelAppKubernetesIOManagedBy: testManagedByKustomize,
+				},
+			}
+			configMap.Object["data"] = map[string]any{
+				"key": "value",
+			}
+
+			resources.Other = []*unstructured.Unstructured{configMap}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify extras directory was created
+			exists, err := afero.Exists(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+
+			// Verify ConfigMap file was created
+			files, err := afero.ReadDir(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1))
+			Expect(files[0].Name()).To(ContainSubstring("custom-config"))
+
+			// Read the ConfigMap file and verify it has Helm templating
+			content, err := afero.ReadFile(fs.FS, filepath.Join("dist/chart/templates/extras", files[0].Name()))
+			Expect(err).NotTo(HaveOccurred())
+			contentStr := string(content)
+
+			// Verify Helm templates are applied
+			Expect(contentStr).To(ContainSubstring("{{ .Release.Namespace }}"))
+			Expect(contentStr).To(ContainSubstring("app.kubernetes.io/name:"))
+			Expect(contentStr).To(ContainSubstring("app.kubernetes.io/managed-by:"))
+		})
+
+		It("should place custom Service in extras directory", func() {
+			// Create a custom Service that is neither webhook nor metrics
+			customService := &unstructured.Unstructured{}
+			customService.SetAPIVersion("v1")
+			customService.SetKind("Service")
+			customService.SetName("custom-service")
+			customService.SetNamespace(testNamespaceTestProjectSystem)
+			customService.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "custom-service",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+				testYAMLFieldLabels: map[string]any{
+					testLabelAppKubernetesIOName:      testProjectName,
+					testLabelAppKubernetesIOManagedBy: testManagedByKustomize,
+				},
+			}
+			customService.Object["spec"] = map[string]any{
+				testYAMLFieldPorts: []any{
+					map[string]any{
+						"port":       8080,
+						"targetPort": 8080,
+					},
+				},
+			}
+
+			resources.Services = []*unstructured.Unstructured{customService}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify extras directory was created
+			exists, err := afero.Exists(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+
+			// Verify Service file was created in extras
+			files, err := afero.ReadDir(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1))
+			Expect(files[0].Name()).To(ContainSubstring("custom-service"))
+		})
+
+		It("should place Secret in extras directory", func() {
+			// Create a Secret
+			secret := &unstructured.Unstructured{}
+			secret.SetAPIVersion("v1")
+			secret.SetKind("Secret")
+			secret.SetName("custom-secret")
+			secret.SetNamespace(testNamespaceTestSystem)
+			secret.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "custom-secret",
+				testYAMLFieldNamespace: testNamespaceTestSystem,
+				testYAMLFieldLabels: map[string]any{
+					testLabelAppKubernetesIOName:      testProjectName,
+					testLabelAppKubernetesIOManagedBy: testManagedByKustomize,
+				},
+			}
+			secret.Object["data"] = map[string]any{
+				"password": "c2VjcmV0",
+			}
+
+			resources.Other = []*unstructured.Unstructured{secret}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify extras directory was created
+			exists, err := afero.Exists(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+
+			// Verify Secret file was created
+			files, err := afero.ReadDir(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1))
+			Expect(files[0].Name()).To(ContainSubstring("custom-secret"))
+
+			// Read the Secret file and verify it has Helm templating
+			content, err := afero.ReadFile(fs.FS, filepath.Join("dist/chart/templates/extras", files[0].Name()))
+			Expect(err).NotTo(HaveOccurred())
+			contentStr := string(content)
+
+			// Verify Helm templates are applied
+			Expect(contentStr).To(ContainSubstring("{{ .Release.Namespace }}"))
+		})
+
+		It("should handle multiple extras resources", func() {
+			// Create multiple extras resources
+			configMap := &unstructured.Unstructured{}
+			configMap.SetAPIVersion("v1")
+			configMap.SetKind("ConfigMap")
+			configMap.SetName("config1")
+			configMap.SetNamespace(testNamespaceTestProjectSystem)
+			configMap.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "config1",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+			}
+
+			secret := &unstructured.Unstructured{}
+			secret.SetAPIVersion("v1")
+			secret.SetKind("Secret")
+			secret.SetName("secret1")
+			secret.SetNamespace(testNamespaceTestProjectSystem)
+			secret.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "secret1",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+			}
+
+			customService := &unstructured.Unstructured{}
+			customService.SetAPIVersion("v1")
+			customService.SetKind("Service")
+			customService.SetName("custom-svc")
+			customService.SetNamespace(testNamespaceTestProjectSystem)
+			customService.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "custom-svc",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+			}
+
+			resources.Other = []*unstructured.Unstructured{configMap, secret}
+			resources.Services = []*unstructured.Unstructured{customService}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify all three files were created
+			files, err := afero.ReadDir(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(3))
+		})
+
+		It("should apply standard Helm labels to extras resources", func() {
+			// Create a ConfigMap
+			configMap := &unstructured.Unstructured{}
+			configMap.SetAPIVersion("v1")
+			configMap.SetKind("ConfigMap")
+			configMap.SetName("test-config")
+			configMap.SetNamespace(testNamespaceTestSystem)
+			configMap.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "test-config",
+				testYAMLFieldNamespace: testNamespaceTestSystem,
+				testYAMLFieldLabels: map[string]any{
+					testLabelAppKubernetesIOName:      testProjectName,
+					testLabelAppKubernetesIOManagedBy: testManagedByKustomize,
+				},
+			}
+
+			resources.Other = []*unstructured.Unstructured{configMap}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Read the ConfigMap file
+			files, err := afero.ReadDir(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(files).To(HaveLen(1))
+
+			content, err := afero.ReadFile(fs.FS, filepath.Join("dist/chart/templates/extras", files[0].Name()))
+			Expect(err).NotTo(HaveOccurred())
+			contentStr := string(content)
+
+			// Verify all standard Helm labels are present
+			Expect(contentStr).To(ContainSubstring("app.kubernetes.io/name: {{ include \"test-project.name\" . }}"))
+			Expect(contentStr).To(ContainSubstring("app.kubernetes.io/instance: {{ .Release.Name }}"))
+			Expect(contentStr).To(ContainSubstring("app.kubernetes.io/managed-by: {{ .Release.Service }}"))
+			Expect(contentStr).To(ContainSubstring(
+				`helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version | replace "+" "_" }}`))
+		})
+
+		It("should not place webhook or metrics services in extras", func() {
+			// Create webhook service
+			webhookService := &unstructured.Unstructured{}
+			webhookService.SetAPIVersion("v1")
+			webhookService.SetKind("Service")
+			webhookService.SetName("test-project-webhook-service")
+			webhookService.SetNamespace(testNamespaceTestProjectSystem)
+			webhookService.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "test-project-webhook-service",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+			}
+
+			// Create metrics service
+			metricsService := &unstructured.Unstructured{}
+			metricsService.SetAPIVersion("v1")
+			metricsService.SetKind("Service")
+			metricsService.SetName("test-project-controller-manager-metrics-service")
+			metricsService.SetNamespace(testNamespaceTestProjectSystem)
+			metricsService.Object["metadata"] = map[string]any{
+				testYAMLFieldName:      "test-project-controller-manager-metrics-service",
+				testYAMLFieldNamespace: testNamespaceTestProjectSystem,
+			}
+
+			resources.Services = []*unstructured.Unstructured{webhookService, metricsService}
+
+			builders := converter.GetChartBuilders()
+			scaffold := machinery.NewScaffold(fs)
+			err := scaffold.Execute(builders...)
+			Expect(err).NotTo(HaveOccurred())
+
+			// Verify extras directory was not created (webhook/metrics go to their own dirs)
+			exists, err := afero.Exists(fs.FS, "dist/chart/templates/extras")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeFalse())
+
+			// Verify webhook directory was created
+			exists, err = afero.Exists(fs.FS, "dist/chart/templates/webhook")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+
+			// Verify metrics directory was created
+			exists, err = afero.Exists(fs.FS, "dist/chart/templates/metrics")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeTrue())
+		})
+	})
+})

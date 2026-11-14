@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,22 +18,37 @@ package yaml
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
+	"runtime"
 	"testing"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/spf13/afero"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/config/store"
-	cfgv2 "sigs.k8s.io/kubebuilder/v3/pkg/config/v2"
-	"sigs.k8s.io/kubebuilder/v3/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config/store"
+	cfgv3 "sigs.k8s.io/kubebuilder/v4/pkg/config/v3"
+	"sigs.k8s.io/kubebuilder/v4/pkg/machinery"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 func TestConfigStoreYaml(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Config Store YAML Suite")
+}
+
+// missingConfigError is the error the store reports when nothing is at the path.
+func missingConfigError(path string) error {
+	return store.LoadError{Err: fmt.Errorf("failed to read %q file: %w", path, os.ErrNotExist)}
+}
+
+// occupiedConfigError is the error the store reports when the path holds no configuration because
+// something else is at it.
+func occupiedConfigError(path, description string) error {
+	return store.LoadError{Err: fmt.Errorf("%q is %s", path, description)}
 }
 
 var _ = Describe("New", func() {
@@ -49,198 +64,697 @@ var _ = Describe("New", func() {
 
 var _ = Describe("yamlStore", func() {
 	const (
-		v2File = `version: "2"
+		v3File = `version: "3"
 `
 		unversionedFile = `version:
 `
 		nonexistentVersionFile = `version: 1-alpha
-`  // v1-alpha never existed
+` // v1-alpha never existed
 		wrongFile = `version: "2"
 layout: ""
-`  // layout field does not exist in v2
+` // layout field does not exist in v2
 	)
 
 	var (
-		s *yamlStore
-
-		path = DefaultPath + "2"
+		s    *yamlStore
+		path string
 	)
 
 	BeforeEach(func() {
 		s = New(machinery.Filesystem{FS: afero.NewMemMapFs()}).(*yamlStore)
+		path = DefaultPath + "2"
 	})
 
 	Context("New", func() {
-		It("should initialize a new Config backend for the provided version", func() {
-			Expect(s.New(cfgv2.Version)).To(Succeed())
-			Expect(s.fs).NotTo(BeNil())
-			Expect(s.mustNotExist).To(BeTrue())
-			Expect(s.Config()).NotTo(BeNil())
-			Expect(s.Config().GetVersion().Compare(cfgv2.Version)).To(Equal(0))
-		})
-
 		It("should fail for an unregistered config version", func() {
 			Expect(s.New(config.Version{})).NotTo(Succeed())
+		})
+
+		It("should require the configuration not to exist yet when saving it", func() {
+			Expect(s.New(cfgv3.Version)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(v3File), os.ModePerm)).To(Succeed())
+
+			Expect(s.Save()).To(MatchError(ContainSubstring("configuration already exists")))
 		})
 	})
 
 	Context("Load", func() {
 		It("should load the Config from an existing file at the default path", func() {
-			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(v2File), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(commentStr+v3File), os.ModePerm)).To(Succeed())
 
 			Expect(s.Load()).To(Succeed())
 			Expect(s.fs).NotTo(BeNil())
 			Expect(s.mustNotExist).To(BeFalse())
 			Expect(s.Config()).NotTo(BeNil())
-			Expect(s.Config().GetVersion().Compare(cfgv2.Version)).To(Equal(0))
+			Expect(s.Config().GetVersion().Compare(cfgv3.Version)).To(Equal(0))
 		})
 
 		It("should fail if no file exists at the default path", func() {
 			err := s.Load()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(missingConfigError(DefaultPath)))
+			Expect(err).To(MatchError(os.ErrNotExist))
+		})
+
+		It("should report a directory at the default path instead of a missing file", func() {
+			Expect(s.fs.MkdirAll(DefaultPath, os.ModePerm)).To(Succeed())
+
+			err := s.Load()
+			Expect(err).To(MatchError(occupiedConfigError(DefaultPath, "a directory")))
+			Expect(err).NotTo(MatchError(os.ErrNotExist))
+		})
+
+		It("should ignore directories named as the config file elsewhere in the project", func() {
+			Expect(s.fs.MkdirAll(filepath.Join("docs", DefaultPath), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(commentStr+v3File), os.ModePerm)).To(Succeed())
+
+			Expect(s.Load()).To(Succeed())
+			Expect(s.Config().GetVersion().Compare(cfgv3.Version)).To(Equal(0))
 		})
 
 		It("should fail if unable to identify the version of the file at the default path", func() {
-			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(unversionedFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(commentStr+unversionedFile), os.ModePerm)).To(Succeed())
 
 			err := s.Load()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to determine config version: %w",
+					fmt.Errorf("error unmarshaling JSON: %w",
+						fmt.Errorf("while decoding JSON: %w",
+							errors.New("project version is empty"),
+						),
+					),
+				),
+			}))
 		})
 
 		It("should fail if unable to create a Config for the version of the file at the default path", func() {
-			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(nonexistentVersionFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(commentStr+nonexistentVersionFile), os.ModePerm)).To(Succeed())
 
 			err := s.Load()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to create config for version %q: %w", "1-alpha", config.UnsupportedVersionError{
+					Version: config.Version{Number: 1, Stage: 2},
+				}),
+			}))
 		})
 
 		It("should fail if unable to unmarshal the file at the default path", func() {
-			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(wrongFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(commentStr+wrongFile), os.ModePerm)).To(Succeed())
 
 			err := s.Load()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to create config for version %q: %w", "2", config.UnsupportedVersionError{
+					Version: config.Version{
+						Number: 2,
+						Stage:  0,
+					},
+				}),
+			}))
 		})
 	})
 
 	Context("LoadFrom", func() {
 		It("should load the Config from an existing file from the specified path", func() {
-			Expect(afero.WriteFile(s.fs, path, []byte(v2File), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, path, []byte(commentStr+v3File), os.ModePerm)).To(Succeed())
 
 			Expect(s.LoadFrom(path)).To(Succeed())
 			Expect(s.fs).NotTo(BeNil())
 			Expect(s.mustNotExist).To(BeFalse())
 			Expect(s.Config()).NotTo(BeNil())
-			Expect(s.Config().GetVersion().Compare(cfgv2.Version)).To(Equal(0))
+			Expect(s.Config().GetVersion().Compare(cfgv3.Version)).To(Equal(0))
 		})
 
 		It("should fail if no file exists at the specified path", func() {
 			err := s.LoadFrom(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(missingConfigError(path)))
+			Expect(err).To(MatchError(os.ErrNotExist))
+		})
+
+		It("should report a directory at the specified path instead of a missing file", func() {
+			Expect(s.fs.MkdirAll(path, os.ModePerm)).To(Succeed())
+
+			err := s.LoadFrom(path)
+			Expect(err).To(MatchError(occupiedConfigError(path, "a directory")))
+			Expect(err).NotTo(MatchError(os.ErrNotExist))
+		})
+
+		It("should never read a non-regular file at the specified path", func() {
+			Expect(afero.WriteFile(s.fs, path, []byte(commentStr+v3File), os.ModePerm)).To(Succeed())
+			fs := &nonRegularFs{Fs: s.fs, path: path}
+			s.fs = fs
+
+			err := s.LoadFrom(path)
+			Expect(err).To(MatchError(occupiedConfigError(path, "not a regular file")))
+			Expect(fs.reads).To(BeZero())
+		})
+
+		It("should load the Config through a symlink to a regular file", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+			Expect(os.WriteFile(target, []byte(commentStr+v3File), 0o644)).To(Succeed())
+			s.fs = afero.NewOsFs()
+
+			Expect(s.LoadFrom(link)).To(Succeed())
+			Expect(s.Config().GetVersion().Compare(cfgv3.Version)).To(Equal(0))
+		})
+
+		It("should report a dangling symbolic link instead of a missing file", func() {
+			skipWithoutSymlinks()
+			link, _ := danglingSymlink()
+			s.fs = afero.NewOsFs()
+
+			err := s.LoadFrom(link)
+			Expect(err).To(MatchError(occupiedConfigError(link, "a symbolic link")))
+			Expect(err).NotTo(MatchError(os.ErrNotExist))
 		})
 
 		It("should fail if unable to identify the version of the file at the specified path", func() {
-			Expect(afero.WriteFile(s.fs, path, []byte(unversionedFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, path, []byte(commentStr+unversionedFile), os.ModePerm)).To(Succeed())
 
 			err := s.LoadFrom(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to determine config version: %w",
+					fmt.Errorf("error unmarshaling JSON: %w",
+						fmt.Errorf("while decoding JSON: %w",
+							errors.New("project version is empty"),
+						),
+					),
+				),
+			}))
 		})
 
 		It("should fail if unable to create a Config for the version of the file at the specified path", func() {
-			Expect(afero.WriteFile(s.fs, path, []byte(nonexistentVersionFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, path, []byte(commentStr+nonexistentVersionFile), os.ModePerm)).To(Succeed())
 
 			err := s.LoadFrom(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to create config for version %q: %w", "1-alpha", config.UnsupportedVersionError{
+					Version: config.Version{Number: 1, Stage: 2},
+				}),
+			}))
 		})
 
 		It("should fail if unable to unmarshal the file at the specified path", func() {
-			Expect(afero.WriteFile(s.fs, path, []byte(wrongFile), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, path, []byte(commentStr+wrongFile), os.ModePerm)).To(Succeed())
 
 			err := s.LoadFrom(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.LoadError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to create config for version %q: %w", "2", config.UnsupportedVersionError{
+					Version: config.Version{
+						Number: 2,
+					},
+				}),
+			}))
 		})
 	})
 
-	Context("Save", func() {
+	Context("legacy controller migration", func() {
+		const legacyProject = `version: "3"
+resources:
+- controller: true
+  group: crew
+  kind: MyKind
+  version: v1
+`
+		// collidingControllersProject records the legacy controller and a name that generates the same
+		// MyKindReconciler, which an older release accepted; such a file cannot be migrated.
+		const collidingControllersProject = legacyProject + `  controllers:
+  - name: my-kind
+`
+		It("should load, save, and reload an unnamed legacy controller", func() {
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(legacyProject), 0o644)).To(Succeed())
+			Expect(s.Load()).To(Succeed())
+			gvk := resource.GVK{Group: "crew", Version: "v1", Kind: "MyKind"}
+			legacy, err := s.Config().GetResource(gvk)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(legacy.Validate()).To(Succeed())
+			Expect(legacy.GetControllerNames()).To(Equal([]string{"mykind"}))
+			Expect(s.Save()).To(Succeed())
+			unchanged, err := s.Config().GetResource(gvk)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(unchanged).To(Equal(legacy))
+			Expect(s.Load()).To(Succeed())
+			migrated, err := s.Config().GetResource(gvk)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(migrated.Validate()).To(Succeed())
+			Expect(migrated.Controller).To(BeFalse()) //nolint:staticcheck // checking the migrated field
+			Expect(migrated.GetControllerNames()).To(Equal(legacy.GetControllerNames()))
+		})
 
+		It("should preserve the PROJECT file when migration fails", func() {
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(collidingControllersProject), 0o644)).To(Succeed())
+			Expect(s.Load()).To(Succeed())
+			Expect(s.Save()).To(MatchError(ContainSubstring("both generate MyKindReconciler")))
+			content, err := afero.ReadFile(s.fs, DefaultPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(collidingControllersProject))
+		})
+
+		It("should not write a new path when migration fails", func() {
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(collidingControllersProject), 0o644)).To(Succeed())
+			Expect(s.Load()).To(Succeed())
+
+			Expect(s.SaveTo(path)).To(MatchError(ContainSubstring("both generate MyKindReconciler")))
+			exists, err := afero.Exists(s.fs, path)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(exists).To(BeFalse())
+			content, err := afero.ReadFile(s.fs, DefaultPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(collidingControllersProject))
+		})
+
+		DescribeTable("should save every legacy controller of a project as a named controller",
+			func(body string, expected map[resource.GVK][]string) {
+				Expect(afero.WriteFile(s.fs, DefaultPath, []byte(body), 0o644)).To(Succeed())
+				Expect(s.Load()).To(Succeed())
+				for gvk, names := range expected {
+					legacy, err := s.Config().GetResource(gvk)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(legacy.GetControllerNames()).To(Equal(names))
+				}
+
+				Expect(s.Save()).To(Succeed())
+
+				Expect(s.Load()).To(Succeed())
+				for gvk, names := range expected {
+					migrated, err := s.Config().GetResource(gvk)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(migrated.Controller).To(BeFalse()) //nolint:staticcheck // checking the migrated field
+					Expect(migrated.GetControllerNames()).To(Equal(names))
+				}
+			},
+			Entry("for a built-in type", `domain: my.domain
+layout:
+- go.kubebuilder.io/v4
+repo: example.com/my-project
+resources:
+- controller: true
+  core: true
+  group: apps
+  kind: Deployment
+  path: k8s.io/api/apps/v1
+  version: v1
+version: "3"
+`, map[resource.GVK][]string{{Group: "apps", Version: "v1", Kind: "Deployment"}: {"deployment"}}),
+			Entry("for a multigroup project", `domain: my.domain
+layout:
+- go.kubebuilder.io/v4
+multigroup: true
+repo: example.com/my-project
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: my.domain
+  group: crew
+  kind: Captain
+  path: example.com/my-project/api/crew/v1
+  version: v1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: my.domain
+  group: ship
+  kind: Frigate
+  path: example.com/my-project/api/ship/v1
+  version: v1
+version: "3"
+`, map[resource.GVK][]string{
+				{Group: "crew", Domain: "my.domain", Version: "v1", Kind: "Captain"}: {"captain"},
+				{Group: "ship", Domain: "my.domain", Version: "v1", Kind: "Frigate"}: {"frigate"},
+			}),
+		)
+	})
+
+	Context("Save", func() {
 		It("should succeed for a valid config", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			Expect(s.Save()).To(Succeed())
 
 			cfgBytes, err := afero.ReadFile(s.fs, DefaultPath)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(cfgBytes)).To(Equal(v2File))
+			Expect(string(cfgBytes)).To(Equal(commentStr + v3File))
 		})
 
 		It("should succeed for a valid config that must not exist", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			s.mustNotExist = true
 			Expect(s.Save()).To(Succeed())
 
 			cfgBytes, err := afero.ReadFile(s.fs, DefaultPath)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(cfgBytes)).To(Equal(v2File))
+			Expect(string(cfgBytes)).To(Equal(commentStr + v3File))
 		})
 
 		It("should fail for an empty config", func() {
 			err := s.Save()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.SaveError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.SaveError{
+				Err: errors.New("undefined config, use one of the initializers: New, Load, LoadFrom"),
+			}))
 		})
 
 		It("should fail for a pre-existent file that must not exist", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			s.mustNotExist = true
-			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(v2File), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, DefaultPath, []byte(v3File), os.ModePerm)).To(Succeed())
 
 			err := s.Save()
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.SaveError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("configuration already exists in %q", DefaultPath),
+			}))
 		})
 	})
 
 	Context("SaveTo", func() {
 		It("should success for valid configs", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			Expect(s.SaveTo(path)).To(Succeed())
 
 			cfgBytes, err := afero.ReadFile(s.fs, path)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(cfgBytes)).To(Equal(`version: "2"
-`))
+			Expect(string(cfgBytes)).To(Equal(commentStr + v3File))
 		})
 
 		It("should succeed for a valid config that must not exist", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			s.mustNotExist = true
 			Expect(s.SaveTo(path)).To(Succeed())
 
 			cfgBytes, err := afero.ReadFile(s.fs, path)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(string(cfgBytes)).To(Equal(v2File))
+			Expect(string(cfgBytes)).To(Equal(commentStr + v3File))
 		})
 
 		It("should fail for an empty config", func() {
 			err := s.SaveTo(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.SaveError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.SaveError{
+				Err: errors.New("undefined config, use one of the initializers: New, Load, LoadFrom"),
+			}))
 		})
 
 		It("should fail for a pre-existent file that must not exist", func() {
-			s.cfg = cfgv2.New()
+			s.cfg = cfgv3.New()
 			s.mustNotExist = true
-			Expect(afero.WriteFile(s.fs, path, []byte(v2File), os.ModePerm)).To(Succeed())
+			Expect(afero.WriteFile(s.fs, path, []byte(v3File), os.ModePerm)).To(Succeed())
 
 			err := s.SaveTo(path)
 			Expect(err).To(HaveOccurred())
-			Expect(errors.As(err, &store.SaveError{})).To(BeTrue())
+			Expect(err).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("configuration already exists in %q", path),
+			}))
+		})
+
+		It("should fail if a directory exists at the target path", func() {
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+			Expect(s.fs.MkdirAll(path, os.ModePerm)).To(Succeed())
+
+			Expect(s.SaveTo(path)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("cannot save configuration to %q: path is a directory", path),
+			}))
+		})
+
+		It("should fail if a non-regular file exists at the target path", func() {
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+			Expect(afero.WriteFile(s.fs, path, []byte(v3File), os.ModePerm)).To(Succeed())
+			s.fs = &nonRegularFs{Fs: s.fs, path: path}
+
+			Expect(s.SaveTo(path)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("cannot save configuration to %q: path is not a regular file", path),
+			}))
+		})
+
+		It("should fail without creating the target if the target path is a dangling symbolic link", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+
+			s.fs = afero.NewOsFs()
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+
+			Expect(s.SaveTo(link)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("cannot save configuration to %q: path is a symbolic link", link),
+			}))
+			Expect(target).NotTo(BeAnExistingFile())
+		})
+
+		It("should fail without creating the target of a dangling symbolic link the filesystem "+
+			"cannot tell apart", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+
+			// A filesystem that is not an afero.Lstater cannot report the link, so the write itself
+			// has to refuse the path.
+			s.fs = &opaqueFs{Fs: afero.NewOsFs()}
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+
+			Expect(s.SaveTo(link)).NotTo(Succeed())
+			Expect(target).NotTo(BeAnExistingFile())
+		})
+
+		It("should update the target when the path is a symbolic link to a regular file", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+			Expect(os.WriteFile(target, []byte("outdated"), 0o644)).To(Succeed())
+
+			s.fs = afero.NewOsFs()
+			s.cfg = cfgv3.New()
+			s.mustNotExist = false
+
+			Expect(s.SaveTo(link)).To(Succeed())
+
+			content, err := os.ReadFile(target)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(content)).To(Equal(commentStr + v3File))
+			expectSymlink(link)
+		})
+
+		It("should report an existing configuration when initializing through a symbolic link to a file", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+			existingContent := []byte(commentStr + v3File)
+			Expect(os.WriteFile(target, existingContent, 0o644)).To(Succeed())
+
+			s.fs = afero.NewOsFs()
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+
+			Expect(s.SaveTo(link)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("configuration already exists in %q", link),
+			}))
+
+			content, err := os.ReadFile(target)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(content).To(Equal(existingContent))
+			expectSymlink(link)
+		})
+
+		It("should fail without creating the target when updating through a dangling symbolic link", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+
+			s.fs = afero.NewOsFs()
+			s.cfg = cfgv3.New()
+			s.mustNotExist = false
+
+			Expect(s.SaveTo(link)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("cannot save configuration to %q: path is a symbolic link", link),
+			}))
+			Expect(target).NotTo(BeAnExistingFile())
+			expectSymlink(link)
+		})
+
+		It("should fail when the target of a symbolic link cannot be checked", func() {
+			skipWithoutSymlinks()
+			link, _ := danglingSymlink()
+			statErr := errors.New("permission denied")
+
+			s.fs = &unreachableLinkTargetFs{failingStatFs{Fs: afero.NewOsFs(), path: link, err: statErr}}
+			s.cfg = cfgv3.New()
+			s.mustNotExist = false
+
+			Expect(s.SaveTo(link)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("failed to check %q: %w", link, statErr),
+			}))
+		})
+
+		It("should fail if the path is a symbolic link to a directory", func() {
+			skipWithoutSymlinks()
+			link, target := danglingSymlink()
+			Expect(os.Mkdir(target, 0o755)).To(Succeed())
+
+			s.fs = afero.NewOsFs()
+			s.cfg = cfgv3.New()
+			s.mustNotExist = false
+
+			Expect(s.SaveTo(link)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("cannot save configuration to %q: path is a directory", link),
+			}))
+			Expect(target).To(BeADirectory())
+			expectSymlink(link)
+		})
+	})
+
+	Context("when the path cannot be checked", func() {
+		var statErr error
+
+		BeforeEach(func() {
+			statErr = errors.New("permission denied")
+			s.fs = &failingStatFs{Fs: s.fs, path: path, err: statErr}
+		})
+
+		It("should fail to load the Config", func() {
+			Expect(s.LoadFrom(path)).To(MatchError(store.LoadError{
+				Err: fmt.Errorf("failed to check %q: %w", path, statErr),
+			}))
+		})
+
+		It("should fail to save a new Config", func() {
+			s.cfg = cfgv3.New()
+			s.mustNotExist = true
+
+			Expect(s.SaveTo(path)).To(MatchError(store.SaveError{
+				Err: fmt.Errorf("failed to check %q: %w", path, statErr),
+			}))
 		})
 	})
 })
+
+var _ = Describe("pathClass", func() {
+	DescribeTable("should describe what occupies the path",
+		func(class pathClass, description string) {
+			Expect(class.String()).To(Equal(description))
+		},
+		Entry("for a regular file", pathRegularFile, "a regular file"),
+		Entry("for a directory", pathDirectory, "a directory"),
+		Entry("for a symbolic link", pathSymbolicLink, "a symbolic link"),
+		Entry("for any other file", pathIrregularFile, "not a regular file"),
+		Entry("for a path where nothing is", pathMissing, ""),
+		Entry("for an unknown class", pathClass(-1), ""),
+	)
+})
+
+// skipWithoutSymlinks skips the test where creating a symbolic link needs extra privileges.
+func skipWithoutSymlinks() {
+	GinkgoHelper()
+
+	if runtime.GOOS == "windows" {
+		Skip("symlink creation requires elevated privileges on Windows")
+	}
+}
+
+// expectSymlink asserts that the path is still a symbolic link, so nothing replaced it.
+func expectSymlink(path string) {
+	GinkgoHelper()
+
+	info, err := os.Lstat(path)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(info.Mode() & os.ModeSymlink).NotTo(BeZero())
+}
+
+// danglingSymlink creates a symbolic link whose target does not exist, and returns both paths.
+func danglingSymlink() (link, target string) {
+	GinkgoHelper()
+
+	dir := GinkgoT().TempDir()
+	link = filepath.Join(dir, DefaultPath)
+	target = filepath.Join(dir, "stolen.yaml")
+	Expect(os.Symlink(target, link)).To(Succeed())
+
+	return link, target
+}
+
+// opaqueFs hides the optional interfaces of the wrapped filesystem, such as afero.Lstater.
+type opaqueFs struct {
+	afero.Fs
+}
+
+// nonRegularFileInfo reports a device file mode on top of the wrapped FileInfo.
+type nonRegularFileInfo struct{ os.FileInfo }
+
+// Mode adds a device-file mode to the wrapped file information.
+func (i nonRegularFileInfo) Mode() os.FileMode { return i.FileInfo.Mode() | os.ModeDevice }
+
+// nonRegularFs makes path look like a non-regular file and counts how many times it is opened.
+type nonRegularFs struct {
+	afero.Fs
+	path  string
+	reads int
+}
+
+// Stat reports the configured path as a non-regular file.
+func (f *nonRegularFs) Stat(name string) (os.FileInfo, error) {
+	info, err := f.Fs.Stat(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat %q: %w", name, err)
+	}
+	if name == f.path {
+		info = nonRegularFileInfo{info}
+	}
+
+	return info, nil
+}
+
+// failingStatFs fails to stat the given path.
+type failingStatFs struct {
+	afero.Fs
+	path string
+	err  error
+}
+
+// Stat returns the configured error for the target path.
+func (f *failingStatFs) Stat(name string) (os.FileInfo, error) {
+	if name == f.path {
+		return nil, f.err
+	}
+
+	info, err := f.Fs.Stat(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat %q: %w", name, err)
+	}
+
+	return info, nil
+}
+
+// unreachableLinkTargetFs reports the symbolic link at the path but fails to follow it.
+type unreachableLinkTargetFs struct {
+	failingStatFs
+}
+
+// LstatIfPossible delegates to the wrapped filesystem, so the link itself is still reported.
+func (f *unreachableLinkTargetFs) LstatIfPossible(name string) (os.FileInfo, bool, error) {
+	info, lstatCalled, err := f.Fs.(afero.Lstater).LstatIfPossible(name)
+	if err != nil {
+		return nil, lstatCalled, fmt.Errorf("failed to lstat %q: %w", name, err)
+	}
+
+	return info, lstatCalled, nil
+}
+
+// Open counts reads of the configured path before delegating to the wrapped filesystem.
+func (f *nonRegularFs) Open(name string) (afero.File, error) {
+	if name == f.path {
+		f.reads++
+	}
+
+	file, err := f.Fs.Open(name)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open %q: %w", name, err)
+	}
+
+	return file, nil
+}

@@ -18,9 +18,9 @@ package util
 
 import (
 	"fmt"
+	log "log/slog"
 	"os"
 	"os/exec"
-	"strings"
 )
 
 // RunCmd prints the provided message and command and then executes it binding stdout and stderr
@@ -28,6 +28,11 @@ func RunCmd(msg, cmd string, args ...string) error {
 	c := exec.Command(cmd, args...) //nolint:gosec
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	fmt.Println(msg + ":\n$ " + strings.Join(c.Args, " "))
-	return c.Run()
+	log.Info(msg)
+
+	if err := c.Run(); err != nil {
+		return fmt.Errorf("error running %q: %w", cmd, err)
+	}
+
+	return nil
 }

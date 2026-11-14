@@ -14,11 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-source test/common.sh
+# Source common.sh for environment setup (PATH, GOBIN, etc.)
+source "$(dirname "$0")/test/common.sh"
 
-header_text "Running kubebuilder unit tests"
-go test -race -v ./pkg/...
+# Build kubebuilder binary
+build_kb
+fetch_tools
 
-./test/integration.sh
+pushd . >/dev/null
 
-./test/testdata/test.sh
+make test
+
+header_text "All tests passed!"
+
+popd >/dev/null

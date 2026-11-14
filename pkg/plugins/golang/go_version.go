@@ -28,26 +28,33 @@ const (
 	goVerPattern = `^go(?P<major>[0-9]+)\.(?P<minor>[0-9]+)(?:\.(?P<patch>[0-9]+)|(?P<pre>(?:alpha|beta|rc)[0-9]+))?$`
 )
 
-var (
-	go113 = goVersion{
-		major: 1,
-		minor: 13,
-	}
-	go116alpha1 = goVersion{
-		major:      1,
-		minor:      16,
-		prerelease: "alpha1",
-	}
+var goVerRegexp = regexp.MustCompile(goVerPattern)
 
-	goVerRegexp = regexp.MustCompile(goVerPattern)
-)
-
-type goVersion struct {
+// GoVersion describes a Go version.
+type GoVersion struct {
 	major, minor, patch int
 	prerelease          string
 }
 
-func (v *goVersion) parse(verStr string) error {
+func (v GoVersion) String() string {
+	switch {
+	case v.patch != 0:
+		return fmt.Sprintf("go%d.%d.%d", v.major, v.minor, v.patch)
+	case v.prerelease != "":
+		return fmt.Sprintf("go%d.%d%s", v.major, v.minor, v.prerelease)
+	}
+	return fmt.Sprintf("go%d.%d", v.major, v.minor)
+}
+
+// MustParse will panic if verStr does not match the expected Go version string spec.
+func MustParse(verStr string) (v GoVersion) {
+	if err := v.parse(verStr); err != nil {
+		panic(err)
+	}
+	return v
+}
+
+func (v *GoVersion) parse(verStr string) error {
 	m := goVerRegexp.FindStringSubmatch(verStr)
 	if m == nil {
 		return fmt.Errorf("invalid version string")
@@ -57,18 +64,18 @@ func (v *goVersion) parse(verStr string) error {
 
 	v.major, err = strconv.Atoi(m[1])
 	if err != nil {
-		return fmt.Errorf("error parsing major version '%s': %s", m[1], err)
+		return fmt.Errorf("error parsing major version %q: %w", m[1], err)
 	}
 
 	v.minor, err = strconv.Atoi(m[2])
 	if err != nil {
-		return fmt.Errorf("error parsing minor version '%s': %s", m[2], err)
+		return fmt.Errorf("error parsing minor version %q: %w", m[2], err)
 	}
 
 	if m[3] != "" {
 		v.patch, err = strconv.Atoi(m[3])
 		if err != nil {
-			return fmt.Errorf("error parsing patch version '%s': %s", m[2], err)
+			return fmt.Errorf("error parsing patch version %q: %w", m[3], err)
 		}
 	}
 
@@ -77,7 +84,8 @@ func (v *goVersion) parse(verStr string) error {
 	return nil
 }
 
-func (v goVersion) compare(other goVersion) int {
+// Compare returns -1, 0, or 1 if v < other, v == other, or v > other, respectively.
+func (v GoVersion) Compare(other GoVersion) int {
 	if v.major > other.major {
 		return 1
 	}
@@ -114,16 +122,16 @@ func (v goVersion) compare(other goVersion) int {
 	return -1
 }
 
-// ValidateGoVersion verifies that Go is installed and the current go version is supported by kubebuilder
-func ValidateGoVersion() error {
-	err := fetchAndCheckGoVersion()
+// ValidateGoVersion verifies that Go is installed and the current go version is supported by a plugin.
+func ValidateGoVersion(minVersion, maxVersion GoVersion) error {
+	err := fetchAndCheckGoVersion(minVersion, maxVersion)
 	if err != nil {
-		return fmt.Errorf("%s. You can skip this check using the --skip-go-version-check flag", err)
+		return fmt.Errorf("you can skip this check using the --skip-go-version-check flag: %w", err)
 	}
 	return nil
 }
 
-func fetchAndCheckGoVersion() error {
+func fetchAndCheckGoVersion(minVersion, maxVersion GoVersion) error {
 	cmd := exec.Command("go", "version")
 	out, err := cmd.Output()
 	if err != nil {
@@ -135,22 +143,20 @@ func fetchAndCheckGoVersion() error {
 		return fmt.Errorf("found invalid Go version: %q", string(out))
 	}
 	goVer := split[2]
-	if err := checkGoVersion(goVer); err != nil {
-		return fmt.Errorf("go version '%s' is incompatible because '%s'", goVer, err)
+	if err := checkGoVersion(goVer, minVersion, maxVersion); err != nil {
+		return fmt.Errorf("go version %q is incompatible: %w", goVer, err)
 	}
 	return nil
 }
 
-// checkGoVersion should only ever check if the Go version >= 1.13, since the kubebuilder binary only cares
-// that the go binary supports go modules which were stabilized in that version (i.e. in go 1.13) by default
-func checkGoVersion(verStr string) error {
-	var version goVersion
+func checkGoVersion(verStr string, minVersion, maxVersion GoVersion) error {
+	var version GoVersion
 	if err := version.parse(verStr); err != nil {
 		return err
 	}
 
-	if version.compare(go113) < 0 || version.compare(go116alpha1) >= 0 {
-		return fmt.Errorf("requires 1.13 <= version < 1.16")
+	if version.Compare(minVersion) < 0 || version.Compare(maxVersion) >= 0 {
+		return fmt.Errorf("plugin requires %q <= version < %q", minVersion, maxVersion)
 	}
 
 	return nil

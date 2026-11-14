@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,8 +22,8 @@ import (
 
 	"sigs.k8s.io/yaml"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 // Version is the config.Version for project configuration 3
@@ -38,7 +38,7 @@ func (ss *stringSlice) UnmarshalJSON(b []byte) error {
 	if b[0] == '[' {
 		var sl []string
 		if err := yaml.Unmarshal(b, &sl); err != nil {
-			return err
+			return fmt.Errorf("error unmarshalling string slice %q: %w", sl, err)
 		}
 		*ss = sl
 		return nil
@@ -46,13 +46,14 @@ func (ss *stringSlice) UnmarshalJSON(b []byte) error {
 
 	var st string
 	if err := yaml.Unmarshal(b, &st); err != nil {
-		return err
+		return fmt.Errorf("error unmarshalling string %q: %w", st, err)
 	}
 	*ss = stringSlice{st}
 	return nil
 }
 
-type cfg struct {
+// Cfg defines the Project Config (PROJECT file)
+type Cfg struct {
 	// Version
 	Version config.Version `json:"version"`
 
@@ -60,11 +61,12 @@ type cfg struct {
 	Domain      string      `json:"domain,omitempty"`
 	Repository  string      `json:"repo,omitempty"`
 	Name        string      `json:"projectName,omitempty"`
+	CliVersion  string      `json:"cliVersion,omitempty"`
 	PluginChain stringSlice `json:"layout,omitempty"`
 
 	// Boolean fields
-	MultiGroup      bool `json:"multigroup,omitempty"`
-	ComponentConfig bool `json:"componentConfig,omitempty"`
+	MultiGroup bool `json:"multigroup,omitempty"`
+	Namespaced bool `json:"namespaced,omitempty"`
 
 	// Resources
 	Resources []resource.Resource `json:"resources,omitempty"`
@@ -77,11 +79,11 @@ type cfg struct {
 type pluginConfigs map[string]pluginConfig
 
 // pluginConfig is an arbitrary plugin configuration object.
-type pluginConfig interface{}
+type pluginConfig any
 
 // New returns a new config.Config
 func New() config.Config {
-	return &cfg{Version: Version}
+	return &Cfg{Version: Version}
 }
 
 func init() {
@@ -89,106 +91,119 @@ func init() {
 }
 
 // GetVersion implements config.Config
-func (c cfg) GetVersion() config.Version {
+func (c Cfg) GetVersion() config.Version {
 	return c.Version
 }
 
+// GetCliVersion implements config.Config
+func (c Cfg) GetCliVersion() string {
+	return c.CliVersion
+}
+
+// SetCliVersion implements config.Config
+func (c *Cfg) SetCliVersion(version string) error {
+	c.CliVersion = version
+	return nil
+}
+
 // GetDomain implements config.Config
-func (c cfg) GetDomain() string {
+func (c Cfg) GetDomain() string {
 	return c.Domain
 }
 
 // SetDomain implements config.Config
-func (c *cfg) SetDomain(domain string) error {
+func (c *Cfg) SetDomain(domain string) error {
 	c.Domain = domain
 	return nil
 }
 
 // GetRepository implements config.Config
-func (c cfg) GetRepository() string {
+func (c Cfg) GetRepository() string {
 	return c.Repository
 }
 
 // SetRepository implements config.Config
-func (c *cfg) SetRepository(repository string) error {
+func (c *Cfg) SetRepository(repository string) error {
 	c.Repository = repository
 	return nil
 }
 
 // GetProjectName implements config.Config
-func (c cfg) GetProjectName() string {
+func (c Cfg) GetProjectName() string {
 	return c.Name
 }
 
 // SetProjectName implements config.Config
-func (c *cfg) SetProjectName(name string) error {
+func (c *Cfg) SetProjectName(name string) error {
 	c.Name = name
 	return nil
 }
 
-// GetLayout implements config.Config
-func (c cfg) GetPluginChain() []string {
+// GetPluginChain implements config.Config
+func (c Cfg) GetPluginChain() []string {
 	return c.PluginChain
 }
 
-// SetLayout implements config.Config
-func (c *cfg) SetPluginChain(pluginChain []string) error {
+// SetPluginChain implements config.Config
+func (c *Cfg) SetPluginChain(pluginChain []string) error {
 	c.PluginChain = pluginChain
 	return nil
 }
 
 // IsMultiGroup implements config.Config
-func (c cfg) IsMultiGroup() bool {
+func (c Cfg) IsMultiGroup() bool {
 	return c.MultiGroup
 }
 
 // SetMultiGroup implements config.Config
-func (c *cfg) SetMultiGroup() error {
+func (c *Cfg) SetMultiGroup() error {
 	c.MultiGroup = true
 	return nil
 }
 
 // ClearMultiGroup implements config.Config
-func (c *cfg) ClearMultiGroup() error {
+func (c *Cfg) ClearMultiGroup() error {
 	c.MultiGroup = false
 	return nil
 }
 
-// IsComponentConfig implements config.Config
-func (c cfg) IsComponentConfig() bool {
-	return c.ComponentConfig
+// IsNamespaced implements config.Config
+func (c Cfg) IsNamespaced() bool {
+	return c.Namespaced
 }
 
-// SetComponentConfig implements config.Config
-func (c *cfg) SetComponentConfig() error {
-	c.ComponentConfig = true
+// SetNamespaced implements config.Config
+func (c *Cfg) SetNamespaced() error {
+	c.Namespaced = true
 	return nil
 }
 
-// ClearComponentConfig implements config.Config
-func (c *cfg) ClearComponentConfig() error {
-	c.ComponentConfig = false
+// ClearNamespaced implements config.Config
+func (c *Cfg) ClearNamespaced() error {
+	c.Namespaced = false
 	return nil
 }
 
 // ResourcesLength implements config.Config
-func (c cfg) ResourcesLength() int {
+func (c Cfg) ResourcesLength() int {
 	return len(c.Resources)
 }
 
 // HasResource implements config.Config
-func (c cfg) HasResource(gvk resource.GVK) bool {
+func (c Cfg) HasResource(gvk resource.GVK) bool {
+	found := false
 	for _, res := range c.Resources {
 		if gvk.IsEqualTo(res.GVK) {
-			return true
+			found = true
+			break
 		}
 	}
 
-	return false
+	return found
 }
 
 // GetResource implements config.Config
-func (c cfg) GetResource(gvk resource.GVK) (resource.Resource, error) {
+func (c Cfg) GetResource(gvk resource.GVK) (resource.Resource, error) {
 	for _, res := range c.Resources {
 		if gvk.IsEqualTo(res.GVK) {
 			r := res.Copy()
@@ -206,7 +221,7 @@ func (c cfg) GetResource(gvk resource.GVK) (resource.Resource, error) {
 }
 
 // GetResources implements config.Config
-func (c cfg) GetResources() ([]resource.Resource, error) {
+func (c Cfg) GetResources() ([]resource.Resource, error) {
 	resources := make([]resource.Resource, 0, len(c.Resources))
 	for _, res := range c.Resources {
 		r := res.Copy()
@@ -223,7 +238,7 @@ func (c cfg) GetResources() ([]resource.Resource, error) {
 }
 
 // AddResource implements config.Config
-func (c *cfg) AddResource(res resource.Resource) error {
+func (c *Cfg) AddResource(res resource.Resource) error {
 	// As res is passed by value it is already a shallow copy, but we need to make a deep copy
 	res = res.Copy()
 
@@ -239,7 +254,7 @@ func (c *cfg) AddResource(res resource.Resource) error {
 }
 
 // UpdateResource implements config.Config
-func (c *cfg) UpdateResource(res resource.Resource) error {
+func (c *Cfg) UpdateResource(res resource.Resource) error {
 	// As res is passed by value it is already a shallow copy, but we need to make a deep copy
 	res = res.Copy()
 
@@ -249,8 +264,12 @@ func (c *cfg) UpdateResource(res resource.Resource) error {
 	}
 
 	for i, r := range c.Resources {
-		if res.GVK.IsEqualTo(r.GVK) {
-			return c.Resources[i].Update(res)
+		if res.IsEqualTo(r.GVK) {
+			if err := c.Resources[i].Update(res); err != nil {
+				return fmt.Errorf("failed to update resource %q: %w", res.GVK, err)
+			}
+
+			return nil
 		}
 	}
 
@@ -259,7 +278,7 @@ func (c *cfg) UpdateResource(res resource.Resource) error {
 }
 
 // HasGroup implements config.Config
-func (c cfg) HasGroup(group string) bool {
+func (c Cfg) HasGroup(group string) bool {
 	// Return true if the target group is found in the tracked resources
 	for _, r := range c.Resources {
 		if strings.EqualFold(group, r.Group) {
@@ -272,7 +291,7 @@ func (c cfg) HasGroup(group string) bool {
 }
 
 // ListCRDVersions implements config.Config
-func (c cfg) ListCRDVersions() []string {
+func (c Cfg) ListCRDVersions() []string {
 	// Make a map to remove duplicates
 	versionSet := make(map[string]struct{})
 	for _, r := range c.Resources {
@@ -290,7 +309,7 @@ func (c cfg) ListCRDVersions() []string {
 }
 
 // ListWebhookVersions implements config.Config
-func (c cfg) ListWebhookVersions() []string {
+func (c Cfg) ListWebhookVersions() []string {
 	// Make a map to remove duplicates
 	versionSet := make(map[string]struct{})
 	for _, r := range c.Resources {
@@ -308,14 +327,14 @@ func (c cfg) ListWebhookVersions() []string {
 }
 
 // DecodePluginConfig implements config.Config
-func (c cfg) DecodePluginConfig(key string, configObj interface{}) error {
+func (c Cfg) DecodePluginConfig(key string, configObj any) error {
 	if len(c.Plugins) == 0 {
 		return config.PluginKeyNotFoundError{Key: key}
 	}
 
 	// Get the object blob by key and unmarshal into the object.
-	if pluginConfig, hasKey := c.Plugins[key]; hasKey {
-		b, err := yaml.Marshal(pluginConfig)
+	if pluginCfg, hasKey := c.Plugins[key]; hasKey {
+		b, err := yaml.Marshal(pluginCfg)
 		if err != nil {
 			return fmt.Errorf("failed to convert extra fields object to bytes: %w", err)
 		}
@@ -329,15 +348,15 @@ func (c cfg) DecodePluginConfig(key string, configObj interface{}) error {
 }
 
 // EncodePluginConfig will return an error if used on any project version < v3.
-func (c *cfg) EncodePluginConfig(key string, configObj interface{}) error {
+func (c *Cfg) EncodePluginConfig(key string, configObj any) error {
 	// Get object's bytes and set them under key in extra fields.
 	b, err := yaml.Marshal(configObj)
 	if err != nil {
-		return fmt.Errorf("failed to convert %T object to bytes: %s", configObj, err)
+		return fmt.Errorf("failed to convert %T object to bytes: %w", configObj, err)
 	}
-	var fields map[string]interface{}
+	var fields map[string]any
 	if err := yaml.Unmarshal(b, &fields); err != nil {
-		return fmt.Errorf("failed to unmarshal %T object bytes: %s", configObj, err)
+		return fmt.Errorf("failed to unmarshal %T object bytes: %w", configObj, err)
 	}
 	if c.Plugins == nil {
 		c.Plugins = make(map[string]pluginConfig)
@@ -346,16 +365,62 @@ func (c *cfg) EncodePluginConfig(key string, configObj interface{}) error {
 	return nil
 }
 
-// Marshal implements config.Config
-func (c cfg) MarshalYAML() ([]byte, error) {
-	for i, r := range c.Resources {
+// configMigrations lists the steps migrate runs, in order. Each step replaces one deprecated
+// top-level field. To deprecate a field, add its step here. A step must copy any map or slice
+// it changes, so MarshalYAML leaves the caller's config unchanged.
+var configMigrations = []func(*Cfg) error{
+	(*Cfg).migrateResources,
+}
+
+// migrate runs configMigrations on c.
+func (c *Cfg) migrate() error {
+	for _, migrate := range configMigrations {
+		if err := migrate(c); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// migrateResources replaces the deprecated fields of each resource.
+func (c *Cfg) migrateResources() error {
+	for i := range c.Resources {
+		if err := c.Resources[i].Migrate(); err != nil {
+			return fmt.Errorf("failed to migrate resources: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// MarshalYAML implements config.Config
+func (c Cfg) MarshalYAML() ([]byte, error) {
+	// Copy resources so serialization leaves the caller's config unchanged.
+	resources := c.Resources
+	c.Resources = make([]resource.Resource, len(resources))
+	for i, original := range resources {
+		c.Resources[i] = original.Copy()
+	}
+	// Migrate deprecated fields when saving the PROJECT file.
+	if err := c.migrate(); err != nil {
+		return nil, config.MarshalError{Err: err}
+	}
+
+	for i := range c.Resources {
+		r := &c.Resources[i]
+		// Omit empty fields after migration, since a step may fill them.
 		// If API is empty, omit it (prevents `api: {}`).
 		if r.API != nil && r.API.IsEmpty() {
-			c.Resources[i].API = nil
+			r.API = nil
 		}
 		// If Webhooks is empty, omit it (prevents `webhooks: {}`).
 		if r.Webhooks != nil && r.Webhooks.IsEmpty() {
-			c.Resources[i].Webhooks = nil
+			r.Webhooks = nil
+		}
+		// If Controllers is empty, omit it (prevents `controllers: []`).
+		if r.Controllers != nil && r.Controllers.IsEmpty() {
+			r.Controllers = nil
 		}
 	}
 
@@ -367,9 +432,12 @@ func (c cfg) MarshalYAML() ([]byte, error) {
 	return content, nil
 }
 
-// Unmarshal implements config.Config
-func (c *cfg) UnmarshalYAML(b []byte) error {
-	if err := yaml.UnmarshalStrict(b, c); err != nil {
+// UnmarshalYAML implements config.Config
+func (c *Cfg) UnmarshalYAML(b []byte) error {
+	// Use non-strict unmarshaling to allow forward compatibility and external plugin fields.
+	// Older versions of kubebuilder should be able to read PROJECT files
+	// with newer fields and simply ignore unknown fields.
+	if err := yaml.Unmarshal(b, c); err != nil {
 		return config.UnmarshalError{Err: err}
 	}
 

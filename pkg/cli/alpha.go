@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,19 +21,26 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	configgen "sigs.k8s.io/kubebuilder/v3/pkg/cli/alpha/config-gen"
+
+	"sigs.k8s.io/kubebuilder/v4/internal/cli/alpha"
 )
 
 const (
 	alphaCommand = "alpha"
 )
 
-var alphaCommands = []*cobra.Command{
-	configgen.NewCommand(),
+// newAlphaSubcommands returns the built-in subcommands of the alpha command. Each CLI gets its own:
+// Cobra records the parent on a command when it is added, so a command shared by several CLIs in
+// one process would run the hooks of the CLI built last.
+func newAlphaSubcommands() []*cobra.Command {
+	return []*cobra.Command{
+		alpha.NewScaffoldCommand(),
+		alpha.NewUpdateCommand(),
+	}
 }
 
 func (c *CLI) newAlphaCmd() *cobra.Command {
-	alpha := &cobra.Command{
+	cmd := asCommandGroup(&cobra.Command{
 		Use:        alphaCommand,
 		SuggestFor: []string{"experimental"},
 		Short:      "Alpha-stage subcommands",
@@ -43,39 +50,36 @@ Alpha subcommands are for unstable features.
 - Alpha subcommands are exploratory and may be removed without warning.
 - No backwards compatibility is provided for any alpha subcommands.
 `),
-	}
-	for i := range alphaCommands {
-		alpha.AddCommand(alphaCommands[i])
-	}
-	return alpha
+	})
+	cmd.AddCommand(newAlphaSubcommands()...)
+	return cmd
 }
 
 func (c *CLI) addAlphaCmd() {
-	if (len(alphaCommands) + len(c.extraAlphaCommands)) > 0 {
-		c.cmd.AddCommand(c.newAlphaCmd())
-	}
+	c.cmd.AddCommand(c.newAlphaCmd())
 }
 
 func (c *CLI) addExtraAlphaCommands() error {
 	// Search for the alpha subcommand
-	var alpha *cobra.Command
+	var cmds *cobra.Command
 	for _, subCmd := range c.cmd.Commands() {
 		if subCmd.Name() == alphaCommand {
-			alpha = subCmd
+			cmds = subCmd
 			break
 		}
 	}
-	if alpha == nil {
+	if cmds == nil {
 		return fmt.Errorf("no %q command found", alphaCommand)
 	}
 
 	for _, cmd := range c.extraAlphaCommands {
-		for _, subCmd := range alpha.Commands() {
+		for _, subCmd := range cmds.Commands() {
 			if cmd.Name() == subCmd.Name() {
 				return fmt.Errorf("command %q already exists", fmt.Sprintf("%s %s", alphaCommand, cmd.Name()))
 			}
 		}
-		alpha.AddCommand(cmd)
+		c.checkCommandLineBeforeHooks(cmd)
+		cmds.AddCommand(cmd)
 	}
 	return nil
 }

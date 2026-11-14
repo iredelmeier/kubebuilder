@@ -19,11 +19,12 @@ package plugin
 import (
 	"fmt"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/config"
-	"sigs.k8s.io/kubebuilder/v3/pkg/internal/validation"
+	"k8s.io/apimachinery/pkg/util/validation"
+
+	"sigs.k8s.io/kubebuilder/v4/pkg/config"
 )
 
 // KeyFor returns a Plugin's unique identifying string.
@@ -40,27 +41,63 @@ func SplitKey(key string) (string, string) {
 	return keyParts[0], keyParts[1]
 }
 
-// GetShortName returns plugin's short name (name before domain) if name
-// is fully qualified (has a domain suffix), otherwise GetShortName returns name.
-// Deprecated
-func GetShortName(name string) string {
-	return strings.SplitN(name, ".", 2)[0]
+// GetPluginKeyForConfig finds which key to use when saving plugin config.
+// When a plugin is wrapped in a bundle, the bundle's key appears in the chain instead of the plugin's key.
+// For example: "deploy-image.my-domain/v1-alpha" wraps "deploy-image.go.kubebuilder.io/v1-alpha".
+// Returns the plugin's own key if nothing matches.
+func GetPluginKeyForConfig(pluginChain []string, p Plugin) string {
+	pluginKey := KeyFor(p)
+
+	// Try exact match first
+	if slices.Contains(pluginChain, pluginKey) {
+		return pluginKey
+	}
+
+	// No exact match. Try matching by base name + version to find bundled plugins.
+	pluginName, _ := SplitKey(pluginKey)
+	pluginVersion := p.Version().String()
+
+	// Get base name (part before first dot): "deploy-image.go.kubebuilder.io" -> "deploy-image"
+	baseName := pluginName
+	if before, _, ok := strings.Cut(pluginName, "."); ok {
+		baseName = before
+	}
+
+	for _, key := range pluginChain {
+		name, version := SplitKey(key)
+		if version != pluginVersion {
+			continue
+		}
+
+		// Check if this key matches the base name
+		keyBaseName := name
+		if before, _, ok := strings.Cut(name, "."); ok {
+			keyBaseName = before
+		}
+
+		if keyBaseName == baseName {
+			return key
+		}
+	}
+
+	// Nothing matched, use plugin's own key
+	return pluginKey
 }
 
 // Validate ensures a Plugin is valid.
 func Validate(p Plugin) error {
 	if err := validateName(p.Name()); err != nil {
-		return fmt.Errorf("invalid plugin name %q: %v", p.Name(), err)
+		return fmt.Errorf("invalid plugin name %q: %w", p.Name(), err)
 	}
 	if err := p.Version().Validate(); err != nil {
-		return fmt.Errorf("invalid plugin version %q: %v", p.Version(), err)
+		return fmt.Errorf("invalid plugin version %q: %w", p.Version(), err)
 	}
 	if len(p.SupportedProjectVersions()) == 0 {
 		return fmt.Errorf("plugin %q must support at least one project version", KeyFor(p))
 	}
 	for _, projectVersion := range p.SupportedProjectVersions() {
 		if err := projectVersion.Validate(); err != nil {
-			return fmt.Errorf("plugin %q supports an invalid project version %q: %v", KeyFor(p), projectVersion, err)
+			return fmt.Errorf("plugin %q supports an invalid project version %q: %w", KeyFor(p), projectVersion, err)
 		}
 	}
 	return nil
@@ -70,13 +107,13 @@ func Validate(p Plugin) error {
 func ValidateKey(key string) error {
 	name, version := SplitKey(key)
 	if err := validateName(name); err != nil {
-		return fmt.Errorf("invalid plugin name %q: %v", name, err)
+		return fmt.Errorf("invalid plugin name %q: %w", name, err)
 	}
 	// CLI-set plugins do not have to contain a version.
 	if version != "" {
 		var v Version
 		if err := v.Parse(version); err != nil {
-			return fmt.Errorf("invalid plugin version %q: %v", version, err)
+			return fmt.Errorf("invalid plugin version %q: %w", version, err)
 		}
 	}
 	return nil
@@ -124,8 +161,8 @@ func CommonSupportedProjectVersions(plugins ...Plugin) []config.Version {
 	}
 
 	// Sort the output to guarantee consistency
-	sort.Slice(supportedProjectVersions, func(i int, j int) bool {
-		return supportedProjectVersions[i].Compare(supportedProjectVersions[j]) == -1
+	slices.SortStableFunc(supportedProjectVersions, func(a, b config.Version) int {
+		return a.Compare(b)
 	})
 
 	return supportedProjectVersions

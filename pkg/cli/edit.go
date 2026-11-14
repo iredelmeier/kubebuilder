@@ -14,14 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package cli //nolint:dupl
+//nolint:dupl
+package cli
 
 import (
 	"fmt"
 
 	"github.com/spf13/cobra"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/plugin"
+	"sigs.k8s.io/kubebuilder/v4/pkg/plugin"
 )
 
 const editErrorMsg = "failed to edit project"
@@ -30,8 +31,10 @@ func (c CLI) newEditCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "edit",
 		Short: "Update the project configuration",
-		Long: `Edit the project configuration.
-`,
+		Long: `Update an initialized project's configuration and scaffold files needed for the selected settings.
+
+Use this command to enable layout options such as multigroup or namespace-scoped deployment, or to run optional
+plugins that modify an existing project.`,
 		RunE: errCmdFunc(
 			fmt.Errorf("project must be initialized"),
 		),
@@ -62,6 +65,12 @@ func (c CLI) newEditCmd() *cobra.Command {
 	}
 
 	c.applySubcommandHooks(cmd, subcommands, editErrorMsg, false)
+
+	// Append plugin table after metadata updates
+	c.appendPluginTable(cmd, func(p plugin.Plugin) bool {
+		_, isValid := p.(plugin.Edit)
+		return isValid
+	}, "Available plugins that support 'edit'")
 
 	return cmd
 }

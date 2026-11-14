@@ -4,7 +4,7 @@
 
 This article outlines steps to run e2e tests on remote clusters for controllers created using `kubebuilder`. For example, after developing a database controller, the developer may want to run some e2e tests on a GKE cluster to verify the controller is working as expected. Currently, `kubebuilder` does not provide a template for running the e2e tests. This article serves to address this deficit.
 
-The steps are as follow:
+The steps are as follows:
 1.  Create a test file named `<some-file-name>_test.go` populated with template below (referring [this](https://github.com/foxish/application/blob/master/e2e/main_test.go)):
 ```
 import (
@@ -13,7 +13,7 @@ import (
     ......
 )
 
-// Specify kubeconfig file 
+// Specify kubeconfig file
 func getClientConfig() (*rest.Config, error) {
     return clientcmd.BuildConfigFromFlags("", path.Join(os.Getenv("HOME"), "<file-path>"))
 }
@@ -46,7 +46,7 @@ var _ = Describe("<some-controller-name> should work", func() {
 
     AfterEach(func() {
         // Delete all test-specific resources
-        ......		
+        ......
 
         // Delete all environment-specific resources
         ......
@@ -57,7 +57,7 @@ var _ = Describe("<some-controller-name> should work", func() {
     It("should do something", func() {
         testDoSomething(k8sClient, roClient)
     })
-    
+
     ......
 ```
 2.  Write some controller-specific e2e tests

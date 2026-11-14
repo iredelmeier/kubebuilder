@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors.
+Copyright 2022 The Kubernetes Authors.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,16 +19,20 @@ package config
 import (
 	"fmt"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"sigs.k8s.io/kubebuilder/v3/pkg/model/resource"
+	"sigs.k8s.io/kubebuilder/v4/pkg/model/resource"
 )
 
 var _ = Describe("UnsupportedVersionError", func() {
-	var err = UnsupportedVersionError{
-		Version: Version{Number: 1},
-	}
+	var err UnsupportedVersionError
+
+	BeforeEach(func() {
+		err = UnsupportedVersionError{
+			Version: Version{Number: 1},
+		}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -38,10 +42,14 @@ var _ = Describe("UnsupportedVersionError", func() {
 })
 
 var _ = Describe("UnsupportedFieldError", func() {
-	var err = UnsupportedFieldError{
-		Version: Version{Number: 1},
-		Field:   "name",
-	}
+	var err UnsupportedFieldError
+
+	BeforeEach(func() {
+		err = UnsupportedFieldError{
+			Version: Version{Number: 1},
+			Field:   "name",
+		}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -51,14 +59,18 @@ var _ = Describe("UnsupportedFieldError", func() {
 })
 
 var _ = Describe("ResourceNotFoundError", func() {
-	var err = ResourceNotFoundError{
-		GVK: resource.GVK{
-			Group:   "group",
-			Domain:  "my.domain",
-			Version: "v1",
-			Kind:    "Kind",
-		},
-	}
+	var err ResourceNotFoundError
+
+	BeforeEach(func() {
+		err = ResourceNotFoundError{
+			GVK: resource.GVK{
+				Group:   "group",
+				Domain:  "my.domain",
+				Version: "v1",
+				Kind:    "Kind",
+			},
+		}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -68,9 +80,13 @@ var _ = Describe("ResourceNotFoundError", func() {
 })
 
 var _ = Describe("PluginKeyNotFoundError", func() {
-	var err = PluginKeyNotFoundError{
-		Key: "go.kubebuilder.io/v1",
-	}
+	var err PluginKeyNotFoundError
+
+	BeforeEach(func() {
+		err = PluginKeyNotFoundError{
+			Key: "go.kubebuilder.io/v1",
+		}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -81,9 +97,14 @@ var _ = Describe("PluginKeyNotFoundError", func() {
 
 var _ = Describe("MarshalError", func() {
 	var (
-		wrapped = fmt.Errorf("error message")
-		err     = MarshalError{Err: wrapped}
+		wrapped error
+		err     MarshalError
 	)
+
+	BeforeEach(func() {
+		wrapped = fmt.Errorf("wrapped error")
+		err = MarshalError{Err: wrapped}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
@@ -100,9 +121,14 @@ var _ = Describe("MarshalError", func() {
 
 var _ = Describe("UnmarshalError", func() {
 	var (
-		wrapped = fmt.Errorf("error message")
-		err     = UnmarshalError{Err: wrapped}
+		wrapped error
+		err     UnmarshalError
 	)
+
+	BeforeEach(func() {
+		wrapped = fmt.Errorf("wrapped error")
+		err = UnmarshalError{Err: wrapped}
+	})
 
 	Context("Error", func() {
 		It("should return the correct error message", func() {
